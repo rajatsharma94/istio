@@ -1204,6 +1204,7 @@ func TestServiceDiscoveryWorkloadInstanceChangeLabel(t *testing.T) {
 		expectServiceInstances(t, sd, selector, 0, instances)
 		expectEvents(t, events,
 			Event{kind: "svcupdate", host: "selector.com", namespace: selector.Namespace},
+			Event{kind: "edscache", host: "selector.com", namespace: selector.Namespace},
 			Event{kind: "xds"})
 	})
 
