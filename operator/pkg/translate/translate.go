@@ -39,7 +39,7 @@ import (
 	"istio.io/istio/operator/pkg/util"
 	"istio.io/istio/operator/pkg/version"
 	oversion "istio.io/istio/operator/version"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
 )
 
 const (
@@ -57,7 +57,7 @@ const (
 	defaultEgressGWName = "istio-egressgateway"
 )
 
-var scope = log.RegisterScope("translator", "API translator", 0)
+var scope = log.RegisterScope("translator", "API translator")
 
 // Translator is a set of mappings to translate between API paths, charts, values.yaml and k8s paths.
 type Translator struct {
@@ -164,6 +164,7 @@ func NewTranslator() *Translator {
 				ResourceName:         "ztunnel",
 				HelmSubdir:           "ztunnel",
 				ToHelmValuesTreeRoot: "ztunnel",
+				ContainerName:        "istio-proxy",
 				FlattenValues:        true,
 			},
 		},
@@ -996,14 +997,14 @@ func MergeK8sObject(base *object.K8sObject, overlayNode any, path util.Path) (*o
 }
 
 // createPatchObjectFromPath constructs patch object for node with path, returns nil object and error if the path is invalid.
-// eg. node:
+// e.g. node:
 //   - name: NEW_VAR
 //     value: new_value
 //
 // and path:
 //
 //	  spec.template.spec.containers.[name:discovery].env
-//	will constructs the following patch object:
+//	will construct the following patch object:
 //	  spec:
 //	    template:
 //	      spec:

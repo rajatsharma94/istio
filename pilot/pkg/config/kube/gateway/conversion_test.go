@@ -30,6 +30,7 @@ import (
 	k8s "sigs.k8s.io/gateway-api/apis/v1alpha2"
 	"sigs.k8s.io/yaml"
 
+	istio "istio.io/api/networking/v1alpha3"
 	"istio.io/istio/pilot/pkg/config/kube/crd"
 	credentials "istio.io/istio/pilot/pkg/credentials/kube"
 	"istio.io/istio/pilot/pkg/features"
@@ -65,7 +66,7 @@ var services = []*model.Service{
 		Attributes: model.ServiceAttributes{
 			Name:      "istio-ingressgateway",
 			Namespace: "istio-system",
-			ClusterExternalAddresses: model.AddressMap{
+			ClusterExternalAddresses: &model.AddressMap{
 				Addresses: map[cluster.ID][]string{
 					"Kubernetes": {"1.2.3.4"},
 				},
@@ -350,8 +351,15 @@ D2lWusoe2/nEqfDVVWGWlyJ7yOmqaVm/iNUN9B2N2g==
 	}
 )
 
-func TestConvertResources(t *testing.T) {
+func init() {
+	features.EnableAlphaGatewayAPI = true
 	features.EnableAmbientControllers = true
+	// Recompute with ambient enabled
+	classInfos = getClassInfos()
+	builtinClasses = getBuiltinClasses()
+}
+
+func TestConvertResources(t *testing.T) {
 	validator := crdvalidation.NewIstioValidator(t)
 	cases := []struct {
 		name string
@@ -359,6 +367,7 @@ func TestConvertResources(t *testing.T) {
 		{"http"},
 		{"tcp"},
 		{"tls"},
+		{"grpc"},
 		{"mismatch"},
 		{"weighted"},
 		{"zero"},
@@ -371,6 +380,9 @@ func TestConvertResources(t *testing.T) {
 		{"reference-policy-service"},
 		{"serviceentry"},
 		{"eastwest"},
+		{"eastwest-tlsoption"},
+		{"eastwest-labelport"},
+		{"eastwest-remote"},
 		{"alias"},
 		{"mcs"},
 		{"route-precedence"},
@@ -419,7 +431,7 @@ func TestConvertResources(t *testing.T) {
 
 			assert.Equal(t, golden, output)
 
-			outputStatus := getStatus(t, kr.GatewayClass, kr.Gateway, kr.HTTPRoute, kr.TLSRoute, kr.TCPRoute)
+			outputStatus := getStatus(t, kr.GatewayClass, kr.Gateway, kr.HTTPRoute, kr.GRPCRoute, kr.TLSRoute, kr.TCPRoute)
 			goldenStatusFile := fmt.Sprintf("testdata/%s.status.yaml.golden", tt.name)
 			if util.Refresh() {
 				if err := os.WriteFile(goldenStatusFile, outputStatus, 0o644); err != nil {
@@ -432,6 +444,493 @@ func TestConvertResources(t *testing.T) {
 			}
 			if diff := cmp.Diff(string(goldenStatus), string(outputStatus)); diff != "" {
 				t.Fatalf("Diff:\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestSortHTTPRoutes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []*istio.HTTPRoute
+		out  []*istio.HTTPRoute
+	}{
+		{
+			"match is preferred over no match",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "/foo",
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "/foo",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{},
+				},
+			},
+		},
+		{
+			"path matching exact > prefix  > regex",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Regex{
+									Regex: ".*foo",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "/foo",
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "/foo",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Regex{
+									Regex: ".*foo",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"path prefix matching with largest characters",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foo",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foobar",
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foobar",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foo",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"path match is preferred over method match",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Method: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "GET",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foobar",
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/foobar",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Method: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{
+									Exact: "GET",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"largest number of header matches is preferred",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"header1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"header1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+								"header2": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value2",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"header1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+								"header2": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value2",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"header1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"largest number of query params is preferred",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+								"param2": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value2",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+								"param2": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value2",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			"path > method > header > query params",
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Method: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{Exact: "GET"},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			[]*istio.HTTPRoute{
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Uri: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Prefix{
+									Prefix: "/",
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Method: &istio.StringMatch{
+								MatchType: &istio.StringMatch_Exact{Exact: "GET"},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							Headers: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Match: []*istio.HTTPMatchRequest{
+						{
+							QueryParams: map[string]*istio.StringMatch{
+								"param1": {
+									MatchType: &istio.StringMatch_Exact{
+										Exact: "value1",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			sortHTTPRoutes(tt.in)
+			if !reflect.DeepEqual(tt.in, tt.out) {
+				t.Fatalf("expected %v, got %v", tt.out, tt.in)
 			}
 		})
 	}
@@ -622,8 +1121,8 @@ func getStatus(t test.Failer, acfgs ...[]config.Config) []byte {
 
 var timestampRegex = regexp.MustCompile(`lastTransitionTime:.*`)
 
-func splitOutput(configs []config.Config) OutputResources {
-	out := OutputResources{
+func splitOutput(configs []config.Config) IstioResources {
+	out := IstioResources{
 		Gateway:        []config.Config{},
 		VirtualService: []config.Config{},
 	}
@@ -639,8 +1138,8 @@ func splitOutput(configs []config.Config) OutputResources {
 	return out
 }
 
-func splitInput(t test.Failer, configs []config.Config) KubernetesResources {
-	out := KubernetesResources{}
+func splitInput(t test.Failer, configs []config.Config) GatewayResources {
+	out := GatewayResources{}
 	namespaces := sets.New[string]()
 	for _, c := range configs {
 		namespaces.Insert(c.Namespace)
@@ -651,6 +1150,8 @@ func splitInput(t test.Failer, configs []config.Config) KubernetesResources {
 			out.Gateway = append(out.Gateway, c)
 		case gvk.HTTPRoute:
 			out.HTTPRoute = append(out.HTTPRoute, c)
+		case gvk.GRPCRoute:
+			out.GRPCRoute = append(out.GRPCRoute, c)
 		case gvk.TCPRoute:
 			out.TCPRoute = append(out.TCPRoute, c)
 		case gvk.TLSRoute:
@@ -712,6 +1213,8 @@ func insertDefaults(cfgs []config.Config) []config.Config {
 			c.Status = kstatus.Wrap(&k8s.GatewayStatus{})
 		case gvk.HTTPRoute:
 			c.Status = kstatus.Wrap(&k8s.HTTPRouteStatus{})
+		case gvk.GRPCRoute:
+			c.Status = kstatus.Wrap(&k8s.GRPCRouteStatus{})
 		case gvk.TCPRoute:
 			c.Status = kstatus.Wrap(&k8s.TCPRouteStatus{})
 		case gvk.TLSRoute:
@@ -777,7 +1280,7 @@ func BenchmarkBuildHTTPVirtualServices(b *testing.B) {
 		Attributes: model.ServiceAttributes{
 			Name:      "istio-ingressgateway",
 			Namespace: "istio-system",
-			ClusterExternalAddresses: model.AddressMap{
+			ClusterExternalAddresses: &model.AddressMap{
 				Addresses: map[cluster.ID][]string{
 					"Kubernetes": {"1.2.3.4"},
 				},
@@ -807,9 +1310,9 @@ func BenchmarkBuildHTTPVirtualServices(b *testing.B) {
 	input := readConfig(b, "testdata/benchmark-httproute.yaml", validator)
 	kr := splitInput(b, input)
 	kr.Context = NewGatewayContext(cg.PushContext())
-	ctx := ConfigContext{
-		KubernetesResources: kr,
-		AllowedReferences:   convertReferencePolicies(kr),
+	ctx := configContext{
+		GatewayResources:  kr,
+		AllowedReferences: convertReferencePolicies(kr),
 	}
 	_, gwMap, _ := convertGateways(ctx)
 	ctx.GatewayReferences = gwMap
@@ -823,5 +1326,92 @@ func BenchmarkBuildHTTPVirtualServices(b *testing.B) {
 		for _, obj := range kr.HTTPRoute {
 			buildHTTPVirtualServices(ctx, obj, gatewayRoutes, meshRoutes)
 		}
+	}
+}
+
+func TestExtractGatewayServices(t *testing.T) {
+	tests := []struct {
+		name            string
+		r               GatewayResources
+		kgw             *k8s.GatewaySpec
+		obj             config.Config
+		gatewayServices []string
+		err             *ConfigError
+	}{
+		{
+			name: "managed gateway",
+			r:    GatewayResources{Domain: "cluster.local"},
+			kgw: &k8s.GatewaySpec{
+				GatewayClassName: "istio",
+			},
+			obj: config.Config{
+				Meta: config.Meta{
+					Name:      "foo",
+					Namespace: "default",
+				},
+			},
+			gatewayServices: []string{"foo-istio.default.svc.cluster.local"},
+		},
+		{
+			name: "managed gateway with name overridden",
+			r:    GatewayResources{Domain: "cluster.local"},
+			kgw: &k8s.GatewaySpec{
+				GatewayClassName: "istio",
+			},
+			obj: config.Config{
+				Meta: config.Meta{
+					Name:      "foo",
+					Namespace: "default",
+					Annotations: map[string]string{
+						gatewayNameOverride: "bar",
+					},
+				},
+			},
+			gatewayServices: []string{"bar.default.svc.cluster.local"},
+		},
+		{
+			name: "unmanaged gateway",
+			r:    GatewayResources{Domain: "domain"},
+			kgw: &k8s.GatewaySpec{
+				GatewayClassName: "istio",
+				Addresses: []k8s.GatewayAddress{
+					{
+						Value: "abc",
+					},
+					{
+						Type: func() *k8s.AddressType {
+							t := k8s.HostnameAddressType
+							return &t
+						}(),
+						Value: "example.com",
+					},
+					{
+						Type: func() *k8s.AddressType {
+							t := k8s.IPAddressType
+							return &t
+						}(),
+						Value: "1.2.3.4",
+					},
+				},
+			},
+			obj: config.Config{
+				Meta: config.Meta{
+					Name:      "foo",
+					Namespace: "default",
+				},
+			},
+			gatewayServices: []string{"abc.default.svc.domain", "example.com"},
+			err: &ConfigError{
+				Reason:  InvalidAddress,
+				Message: "only Hostname is supported, ignoring [1.2.3.4]",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gatewayServices, err := extractGatewayServices(tt.r, tt.kgw, tt.obj)
+			assert.Equal(t, gatewayServices, tt.gatewayServices)
+			assert.Equal(t, err, tt.err)
+		})
 	}
 }

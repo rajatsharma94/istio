@@ -166,7 +166,7 @@ spec:
       urlRewrite:
         hostname: "new.example.com"
         path:
-          type: ReplaceFullPath # Not currently supported
+          type: ReplaceFullPath
           replaceFullPath: "/replacement"
     backendRefs:
     - name: httpbin
@@ -187,6 +187,11 @@ spec:
       requestMirror:
         backendRef:
           name: httpbin-mirror
+          port: 80
+    - type: RequestMirror
+      requestMirror:
+        backendRef:
+          name: httpbin-second
           port: 80
     backendRefs:
     - name: httpbin

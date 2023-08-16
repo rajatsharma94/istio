@@ -96,6 +96,7 @@ func validateHTTPRoute(http *networking.HTTPRoute, delegate, gatewaySemantics bo
 	}
 
 	errs = appendValidation(errs, validateDestination(http.Mirror))
+	errs = appendValidation(errs, validateHTTPMirrors(http.Mirrors))
 	errs = appendValidation(errs, validateHTTPRedirect(http.Redirect))
 	errs = appendValidation(errs, validateHTTPDirectResponse(http.DirectResponse))
 	errs = appendValidation(errs, validateHTTPRetry(http.Retries))
@@ -141,6 +142,13 @@ func validateHTTPRouteMatchRequest(http *networking.HTTPRoute, routeType HTTPRou
 					if header == nil {
 						errs = appendErrors(errs, fmt.Errorf("header match %v cannot be null", name))
 					}
+
+					if _, ok := header.GetMatchType().(*networking.StringMatch_Prefix); ok {
+						if header.GetPrefix() == "" {
+							errs = appendErrors(errs, fmt.Errorf("header prefix match %v may not be empty", name))
+						}
+					}
+
 					errs = appendErrors(errs, ValidateHTTPHeaderName(name))
 					errs = appendErrors(errs, validateStringMatchRegexp(header, "headers"))
 				}
@@ -161,6 +169,13 @@ func validateHTTPRouteMatchRequest(http *networking.HTTPRoute, routeType HTTPRou
 					if header == nil {
 						errs = appendErrors(errs, fmt.Errorf("header match %v cannot be null", name))
 					}
+
+					if _, ok := header.GetMatchType().(*networking.StringMatch_Prefix); ok {
+						if header.GetPrefix() == "" {
+							errs = appendErrors(errs, fmt.Errorf("header prefix match %v may not be empty", name))
+						}
+					}
+
 					errs = appendErrors(errs, ValidateHTTPHeaderName(name))
 				}
 				for name, param := range match.QueryParams {
@@ -252,6 +267,10 @@ func validateHTTPRouteConflict(http *networking.HTTPRoute, routeType HTTPRouteTy
 		}
 	} else if len(http.Route) == 0 {
 		errs = appendErrors(errs, errors.New("HTTP route, redirect or direct_response is required"))
+	}
+
+	if http.Mirror != nil && len(http.Mirrors) > 0 {
+		errs = appendErrors(errs, errors.New("HTTP route cannot contain both mirror and mirrors"))
 	}
 
 	return errs

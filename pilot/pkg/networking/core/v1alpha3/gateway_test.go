@@ -475,6 +475,77 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
+			name: "no credential name key and cert subject alt names tls OPTIONAL_MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:              networking.ServerTLSSettings_OPTIONAL_MUTUAL,
+					ServerCertificate: "server-cert.crt",
+					PrivateKey:        "private-key.key",
+					CaCertificates:    "ca-cert.crt",
+					SubjectAltNames:   []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name: "file-cert:server-cert.crt~private-key.key",
+							SdsConfig: &core.ConfigSource{
+								ResourceApiVersion: core.ApiVersion_V3,
+								ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+									ApiConfigSource: &core.ApiConfigSource{
+										ApiType:                   core.ApiConfigSource_GRPC,
+										SetNodeOnFirstMessageOnly: true,
+										TransportApiVersion:       core.ApiVersion_V3,
+										GrpcServices: []*core.GrpcService{
+											{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+							},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name: "file-root:ca-cert.crt",
+								SdsConfig: &core.ConfigSource{
+									ResourceApiVersion: core.ApiVersion_V3,
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType:                   core.ApiConfigSource_GRPC,
+											SetNodeOnFirstMessageOnly: true,
+											TransportApiVersion:       core.ApiVersion_V3,
+											GrpcServices: []*core.GrpcService{
+												{
+													TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+														EnvoyGrpc: &core.GrpcService_EnvoyGrpc{ClusterName: model.SDSClusterName},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
+			},
+		},
+		{
 			// Credential name and subject names are specified, SDS configs are generated for fetching
 			// key/cert and root cert.
 			name: "credential name subject alternative name key and cert tls MUTUAL",
@@ -513,6 +584,47 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 					},
 				},
 				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
+			// Credential name and subject names are specified, SDS configs are generated for fetching
+			// key/cert and root cert.
+			name: "credential name subject alternative name key and cert tls OPTIONAL_MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:              networking.ServerTLSSettings_OPTIONAL_MUTUAL,
+					CredentialName:    "ingress-sds-resource-name",
+					ServerCertificate: "server-cert.crt",
+					PrivateKey:        "private-key.key",
+					SubjectAltNames:   []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name:      "kubernetes://ingress-sds-resource-name",
+							SdsConfig: model.SDSAdsConfig,
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+							},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name:      "kubernetes://ingress-sds-resource-name-cacert",
+								SdsConfig: model.SDSAdsConfig,
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
 			},
 		},
 		{
@@ -681,7 +793,7 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
-			name: "ecdh curves specified in mesh config with tls SIMPLE",
+			name: "ecdh curves and cipher suites specified in mesh config with tls SIMPLE",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
 				Port: &networking.Port{
@@ -695,14 +807,16 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 			mesh: &meshconfig.MeshConfig{
 				TlsDefaults: &meshconfig.MeshConfig_TLSConfig{
-					EcdhCurves: []string{"P-256"},
+					EcdhCurves:   []string{"P-256"},
+					CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA"},
 				},
 			},
 			result: &auth.DownstreamTlsContext{
 				CommonTlsContext: &auth.CommonTlsContext{
 					AlpnProtocols: util.ALPNHttp,
 					TlsParams: &auth.TlsParameters{
-						EcdhCurves: []string{"P-256"},
+						EcdhCurves:   []string{"P-256"},
+						CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA"},
 					},
 					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
 						{
@@ -731,7 +845,7 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
-			name: "ecdh curves specified in mesh config with, tls mode ISTIO_MUTUAL",
+			name: "ecdh curves and cipher suites specified in mesh config with, tls mode ISTIO_MUTUAL",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com"},
 				Port: &networking.Port{
@@ -743,7 +857,8 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 			mesh: &meshconfig.MeshConfig{
 				TlsDefaults: &meshconfig.MeshConfig_TLSConfig{
-					EcdhCurves: []string{"P-256"},
+					EcdhCurves:   []string{"P-256"},
+					CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES256-GCM-SHA384"},
 				},
 			},
 			result: &auth.DownstreamTlsContext{
@@ -803,7 +918,7 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 		},
 		{
-			name: "ecdh curves specified in mesh config with tls MUTUAL",
+			name: "ecdh curves and cipher suites specified in mesh config with tls MUTUAL",
 			server: &networking.Server{
 				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
 				Port: &networking.Port{
@@ -819,13 +934,15 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 			},
 			mesh: &meshconfig.MeshConfig{
 				TlsDefaults: &meshconfig.MeshConfig_TLSConfig{
-					EcdhCurves: []string{"P-256", "P-384"},
+					EcdhCurves:   []string{"P-256", "P-384"},
+					CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES256-GCM-SHA384"},
 				},
 			},
 			result: &auth.DownstreamTlsContext{
 				CommonTlsContext: &auth.CommonTlsContext{
 					TlsParams: &auth.TlsParameters{
-						EcdhCurves: []string{"P-256", "P-384"},
+						EcdhCurves:   []string{"P-256", "P-384"},
+						CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES256-GCM-SHA384"},
 					},
 					AlpnProtocols: util.ALPNHttp,
 					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
@@ -847,6 +964,55 @@ func TestBuildGatewayListenerTlsContext(t *testing.T) {
 					},
 				},
 				RequireClientCertificate: proto.BoolTrue,
+			},
+		},
+		{
+			name: "ecdh curves and cipher suites specified in mesh config with tls OPTIONAL MUTUAL",
+			server: &networking.Server{
+				Hosts: []string{"httpbin.example.com", "bookinfo.example.com"},
+				Port: &networking.Port{
+					Protocol: string(protocol.HTTPS),
+				},
+				Tls: &networking.ServerTLSSettings{
+					Mode:              networking.ServerTLSSettings_OPTIONAL_MUTUAL,
+					CredentialName:    "ingress-sds-resource-name",
+					ServerCertificate: "server-cert.crt",
+					PrivateKey:        "private-key.key",
+					SubjectAltNames:   []string{"subject.name.a.com", "subject.name.b.com"},
+				},
+			},
+			mesh: &meshconfig.MeshConfig{
+				TlsDefaults: &meshconfig.MeshConfig_TLSConfig{
+					EcdhCurves:   []string{"P-256", "P-384"},
+					CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES256-GCM-SHA384"},
+				},
+			},
+			result: &auth.DownstreamTlsContext{
+				CommonTlsContext: &auth.CommonTlsContext{
+					TlsParams: &auth.TlsParameters{
+						EcdhCurves:   []string{"P-256", "P-384"},
+						CipherSuites: []string{"ECDHE-ECDSA-AES128-SHA", "ECDHE-RSA-AES256-GCM-SHA384"},
+					},
+					AlpnProtocols: util.ALPNHttp,
+					TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{
+						{
+							Name:      "kubernetes://ingress-sds-resource-name",
+							SdsConfig: model.SDSAdsConfig,
+						},
+					},
+					ValidationContextType: &auth.CommonTlsContext_CombinedValidationContext{
+						CombinedValidationContext: &auth.CommonTlsContext_CombinedCertificateValidationContext{
+							DefaultValidationContext: &auth.CertificateValidationContext{
+								MatchSubjectAltNames: util.StringToExactMatch([]string{"subject.name.a.com", "subject.name.b.com"}),
+							},
+							ValidationContextSdsSecretConfig: &auth.SdsSecretConfig{
+								Name:      "kubernetes://ingress-sds-resource-name-cacert",
+								SdsConfig: model.SDSAdsConfig,
+							},
+						},
+					},
+				},
+				RequireClientCertificate: proto.BoolFalse,
 			},
 		},
 		{
@@ -2177,16 +2343,16 @@ func TestBuildGatewayListeners(t *testing.T) {
 		{
 			"targetPort overrides service port",
 			&pilot_model.Proxy{
-				ServiceInstances: []*pilot_model.ServiceInstance{
+				ServiceTargets: []pilot_model.ServiceTarget{
 					{
 						Service: &pilot_model.Service{
 							Hostname: "test",
 						},
-						ServicePort: &pilot_model.Port{
-							Port: 80,
-						},
-						Endpoint: &pilot_model.IstioEndpoint{
-							EndpointPort: 8080,
+						Port: pilot_model.ServiceInstancePort{
+							ServicePort: &pilot_model.Port{
+								Port: 80,
+							},
+							TargetPort: 8080,
 						},
 					},
 				},
@@ -2817,7 +2983,7 @@ func TestBuildGatewayListeners(t *testing.T) {
 			cg := NewConfigGenTest(t, TestOptions{
 				Configs: Configs,
 			})
-			cg.MemRegistry.WantGetProxyServiceInstances = tt.node.ServiceInstances
+			cg.MemRegistry.WantGetProxyServiceTargets = tt.node.ServiceTargets
 			proxy := cg.SetupProxy(&proxyGateway)
 			if tt.node.Metadata != nil {
 				proxy.Metadata = tt.node.Metadata
@@ -2934,7 +3100,7 @@ func TestBuildNameToServiceMapForHttpRoutes(t *testing.T) {
 	}
 	proxy = cg.SetupProxy(proxy)
 
-	nameToServiceMap := buildNameToServiceMapForHTTPRoutes(proxy, cg.env.PushContext, virtualService)
+	nameToServiceMap := buildNameToServiceMapForHTTPRoutes(proxy, cg.env.PushContext(), virtualService)
 
 	if len(nameToServiceMap) != 3 {
 		t.Errorf("The length of nameToServiceMap is wrong.")
@@ -2971,11 +3137,11 @@ func TestBuildNameToServiceMapForHttpRoutes(t *testing.T) {
 
 func TestBuildGatewayListenersFilters(t *testing.T) {
 	cases := []struct {
-		name                   string
-		gateways               []config.Config
-		virtualServices        []config.Config
-		expectedHTTPFilters    []string
-		expectedNetworkFilters []string
+		name             string
+		gateways         []config.Config
+		virtualServices  []config.Config
+		proxyConfig      *pilot_model.NodeMetaProxyConfig
+		expectedListener listenertest.ListenerTest
 	}{
 		{
 			name: "http server",
@@ -2992,12 +3158,16 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 				},
 			},
 			virtualServices: nil,
-			expectedHTTPFilters: []string{
-				xdsfilters.MxFilterName,
-				xdsfilters.Alpn.GetName(),
-				xdsfilters.Fault.GetName(), xdsfilters.Cors.GetName(), xdsfilters.Router.GetName(),
-			},
-			expectedNetworkFilters: []string{wellknown.HTTPConnectionManager},
+			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
+				{
+					NetworkFilters: []string{wellknown.HTTPConnectionManager},
+					HTTPFilters: []string{
+						xdsfilters.MxFilterName,
+						xdsfilters.Alpn.GetName(),
+						xdsfilters.Fault.GetName(), xdsfilters.Cors.GetName(), xdsfilters.Router.GetName(),
+					},
+				},
+			}},
 		},
 		{
 			name: "passthrough server",
@@ -3041,8 +3211,12 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					},
 				},
 			},
-			expectedHTTPFilters:    []string{},
-			expectedNetworkFilters: []string{wellknown.TCPProxy},
+			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
+				{
+					NetworkFilters: []string{wellknown.TCPProxy},
+					HTTPFilters:    []string{},
+				},
+			}},
 		},
 		{
 			name: "terminated-tls server",
@@ -3085,8 +3259,12 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					},
 				},
 			},
-			expectedHTTPFilters:    []string{},
-			expectedNetworkFilters: []string{wellknown.TCPProxy},
+			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
+				{
+					NetworkFilters: []string{wellknown.TCPProxy},
+					HTTPFilters:    []string{},
+				},
+			}},
 		},
 		{
 			name: "non-http istio-mtls server",
@@ -3129,8 +3307,187 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 					},
 				},
 			},
-			expectedHTTPFilters:    []string{},
-			expectedNetworkFilters: []string{xdsfilters.TCPListenerMx.GetName(), wellknown.TCPProxy},
+			expectedListener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
+				{
+					NetworkFilters: []string{xdsfilters.TCPListenerMx.GetName(), wellknown.TCPProxy},
+					HTTPFilters:    []string{},
+				},
+			}},
+		},
+		{
+			name: "http and tcp istio-mtls server",
+			gateways: []config.Config{
+				{
+					Meta: config.Meta{Name: "gateway", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "mtls", Number: 15443, Protocol: "HTTPS"},
+								Hosts: []string{"www.example.com"},
+								Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_ISTIO_MUTUAL},
+							},
+							{
+								Port:  &networking.Port{Name: "mtls", Number: 15443, Protocol: "TLS"},
+								Hosts: []string{"tcp.example.com"},
+								Tls:   &networking.ServerTLSSettings{Mode: networking.ServerTLSSettings_ISTIO_MUTUAL},
+							},
+						},
+					},
+				},
+			},
+			virtualServices: []config.Config{
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: uuid.NewString(), GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway"},
+						Hosts:    []string{"www.example.com"},
+						Http: []*networking.HTTPRoute{
+							{
+								Match: []*networking.HTTPMatchRequest{
+									{
+										Port: 15443,
+									},
+								},
+								Route: []*networking.HTTPRouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "http.com",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: uuid.NewString(), GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/gateway"},
+						Hosts:    []string{"tcp.example.com"},
+						Tcp: []*networking.TCPRoute{
+							{
+								Match: []*networking.L4MatchAttributes{
+									{
+										Port: 15443,
+									},
+								},
+								Route: []*networking.RouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "tcp.com",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedListener: listenertest.ListenerTest{
+				TotalMatch: true,
+				FilterChains: []listenertest.FilterChainTest{
+					{
+						TotalMatch:     true, // there must be only 1 `istio_authn` network filter
+						NetworkFilters: []string{xdsfilters.IstioNetworkAuthenticationFilter.GetName(), wellknown.HTTPConnectionManager},
+						HTTPFilters: []string{
+							xdsfilters.MxFilterName,
+							xdsfilters.GrpcStats.GetName(),
+							xdsfilters.Alpn.GetName(),
+							xdsfilters.Fault.GetName(), xdsfilters.Cors.GetName(), xdsfilters.Router.GetName(),
+						},
+					},
+					{
+						TotalMatch:     true, // there must be only 1 `istio_authn` network filter
+						NetworkFilters: []string{xdsfilters.TCPListenerMx.GetName(), xdsfilters.IstioNetworkAuthenticationFilter.GetName(), wellknown.TCPProxy},
+						HTTPFilters:    []string{},
+					},
+				},
+			},
+		},
+		{
+			name: "http server with proxy proto",
+			gateways: []config.Config{
+				{
+					Meta: config.Meta{Name: "http-server", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port: &networking.Port{Name: "http", Number: 80, Protocol: "HTTP"},
+							},
+						},
+					},
+				},
+			},
+			proxyConfig: &pilot_model.NodeMetaProxyConfig{
+				GatewayTopology: &meshconfig.Topology{ProxyProtocol: &meshconfig.Topology_ProxyProtocolConfiguration{}},
+			},
+			expectedListener: listenertest.ListenerTest{
+				FilterChains: []listenertest.FilterChainTest{
+					{
+						NetworkFilters: []string{wellknown.HTTPConnectionManager},
+						HTTPFilters: []string{
+							xdsfilters.MxFilterName,
+							xdsfilters.Alpn.GetName(),
+							xdsfilters.Fault.GetName(), xdsfilters.Cors.GetName(), xdsfilters.Router.GetName(),
+						},
+					},
+				},
+				Filters: []string{wellknown.ProxyProtocol},
+			},
+		},
+		{
+			name: "terminated-tls server with proxy proto",
+			gateways: []config.Config{
+				{
+					Meta: config.Meta{Name: "terminated-tls-gateway", Namespace: "testns", GroupVersionKind: gvk.Gateway},
+					Spec: &networking.Gateway{
+						Servers: []*networking.Server{
+							{
+								Port:  &networking.Port{Name: "tls", Number: 5678, Protocol: "TLS"},
+								Hosts: []string{"barone.example.com"},
+								Tls:   &networking.ServerTLSSettings{CredentialName: "test", Mode: networking.ServerTLSSettings_SIMPLE},
+							},
+						},
+					},
+				},
+			},
+			proxyConfig: &pilot_model.NodeMetaProxyConfig{
+				GatewayTopology: &meshconfig.Topology{ProxyProtocol: &meshconfig.Topology_ProxyProtocolConfiguration{}},
+			},
+			virtualServices: []config.Config{
+				{
+					Meta: config.Meta{Name: uuid.NewString(), Namespace: uuid.NewString(), GroupVersionKind: gvk.VirtualService},
+					Spec: &networking.VirtualService{
+						Gateways: []string{"testns/terminated-tls-gateway"},
+						Hosts:    []string{"barone.example.com"},
+						Tcp: []*networking.TCPRoute{
+							{
+								Match: []*networking.L4MatchAttributes{
+									{
+										Port: 5678,
+									},
+								},
+								Route: []*networking.RouteDestination{
+									{
+										Destination: &networking.Destination{
+											Host: "foo.com",
+										},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			expectedListener: listenertest.ListenerTest{
+				FilterChains: []listenertest.FilterChainTest{
+					{
+						NetworkFilters: []string{wellknown.TCPProxy},
+						HTTPFilters:    []string{},
+					},
+				},
+				Filters: []string{wellknown.ProxyProtocol},
+			},
 		},
 	}
 	for _, tt := range cases {
@@ -3142,16 +3499,14 @@ func TestBuildGatewayListenersFilters(t *testing.T) {
 				Configs: Configs,
 			})
 			proxy := cg.SetupProxy(&proxyGateway)
-			proxy.Metadata = &proxyGatewayMetadata
+			metadata := proxyGatewayMetadata
+			metadata.ProxyConfig = tt.proxyConfig
+			proxy.Metadata = &metadata
+			proxy.IstioVersion = nil // to ensure `util.IsIstioVersionGE117(node.IstioVersion) == true`
 
 			builder := cg.ConfigGen.buildGatewayListeners(&ListenerBuilder{node: proxy, push: cg.PushContext()})
 			listenertest.VerifyListeners(t, builder.gatewayListeners, listenertest.ListenersTest{
-				Listener: listenertest.ListenerTest{FilterChains: []listenertest.FilterChainTest{
-					{
-						NetworkFilters: tt.expectedNetworkFilters,
-						HTTPFilters:    tt.expectedHTTPFilters,
-					},
-				}},
+				Listener: tt.expectedListener,
 			})
 		})
 	}

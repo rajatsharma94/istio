@@ -75,11 +75,13 @@ func ServiceToServiceEntry(svc *model.Service, proxy *model.Proxy) *config.Confi
 		//  - ClientSideLB - regular ClusterIP clusters (VIP, resolved via EDS)
 		//  - DNSLB - if ExternalName is specified. Also meshExternal is set.
 
-		WorkloadSelector: &networking.WorkloadSelector{Labels: svc.Attributes.LabelSelectors},
-
 		// This is based on alpha.istio.io/canonical-serviceaccounts and
 		//  alpha.istio.io/kubernetes-serviceaccounts.
 		SubjectAltNames: svc.ServiceAccounts,
+	}
+
+	if len(svc.Attributes.LabelSelectors) > 0 {
+		se.WorkloadSelector = &networking.WorkloadSelector{Labels: svc.Attributes.LabelSelectors}
 	}
 
 	// Based on networking.istio.io/exportTo annotation
@@ -274,7 +276,11 @@ func (s *Controller) convertEndpoint(service *model.Service, servicePort *networ
 		sa = spiffe.MustGenSpiffeURI(service.Attributes.Namespace, wle.ServiceAccount)
 	}
 	networkID := s.workloadEntryNetwork(wle)
-	labels := labelutil.AugmentLabels(wle.Labels, clusterID, wle.Locality, "", networkID)
+	locality := wle.Locality
+	if locality == "" && len(wle.Labels[model.LocalityLabel]) > 0 {
+		locality = model.GetLocalityLabel(wle.Labels[model.LocalityLabel])
+	}
+	labels := labelutil.AugmentLabels(wle.Labels, clusterID, locality, "", networkID)
 	return &model.ServiceInstance{
 		Endpoint: &model.IstioEndpoint{
 			Address:         addr,
@@ -282,7 +288,7 @@ func (s *Controller) convertEndpoint(service *model.Service, servicePort *networ
 			ServicePortName: servicePort.Name,
 			Network:         network.ID(wle.Network),
 			Locality: model.Locality{
-				Label:     wle.Locality,
+				Label:     locality,
 				ClusterID: clusterID,
 			},
 			LbWeight:       wle.Weight,
@@ -299,7 +305,7 @@ func (s *Controller) convertEndpoint(service *model.Service, servicePort *networ
 	}
 }
 
-// convertWorkloadEntryToServiceInstances translates a WorkloadEntry into ServiceInstances. This logic is largely the
+// convertWorkloadEntryToServiceInstances translates a WorkloadEntry into ServiceEndpoints. This logic is largely the
 // same as the ServiceEntry convertServiceEntryToInstances.
 func (s *Controller) convertWorkloadEntryToServiceInstances(wle *networking.WorkloadEntry, services []*model.Service,
 	se *networking.ServiceEntry, configKey *configKey, clusterID cluster.ID,
@@ -389,12 +395,12 @@ func convertWorkloadInstanceToServiceInstance(workloadInstance *model.WorkloadIn
 			} else {
 				targetPort = serviceEntryPort.Number
 			}
-			ep := *workloadInstance.Endpoint
+			ep := workloadInstance.Endpoint.ShallowCopy()
 			ep.ServicePortName = serviceEntryPort.Name
 			ep.EndpointPort = targetPort
-			ep.EnvoyEndpoint = nil
+			ep.ComputeEnvoyEndpoint(nil)
 			out = append(out, &model.ServiceInstance{
-				Endpoint:    &ep,
+				Endpoint:    ep,
 				Service:     service,
 				ServicePort: convertPort(serviceEntryPort),
 			})
@@ -406,14 +412,14 @@ func convertWorkloadInstanceToServiceInstance(workloadInstance *model.WorkloadIn
 // Convenience function to convert a workloadEntry into a WorkloadInstance object encoding the endpoint (without service
 // port names) and the namespace - k8s will consume this workload instance when selecting workload entries
 func (s *Controller) convertWorkloadEntryToWorkloadInstance(cfg config.Config, clusterID cluster.ID) *model.WorkloadInstance {
-	we := convertWorkloadEntry(cfg)
+	we := ConvertWorkloadEntry(cfg)
 	addr := we.GetAddress()
 	dnsServiceEntryOnly := false
 	if strings.HasPrefix(addr, model.UnixAddressPrefix) {
 		// k8s can't use uds for service objects
 		dnsServiceEntryOnly = true
 	}
-	if !netutil.IsValidIPAddress(addr) {
+	if addr != "" && !netutil.IsValidIPAddress(addr) {
 		// k8s can't use workloads with hostnames in the address field.
 		dnsServiceEntryOnly = true
 	}
@@ -423,14 +429,18 @@ func (s *Controller) convertWorkloadEntryToWorkloadInstance(cfg config.Config, c
 		sa = spiffe.MustGenSpiffeURI(cfg.Namespace, we.ServiceAccount)
 	}
 	networkID := s.workloadEntryNetwork(we)
-	labels := labelutil.AugmentLabels(we.Labels, clusterID, we.Locality, "", networkID)
+	locality := we.Locality
+	if locality == "" && len(we.Labels[model.LocalityLabel]) > 0 {
+		locality = model.GetLocalityLabel(we.Labels[model.LocalityLabel])
+	}
+	labels := labelutil.AugmentLabels(we.Labels, clusterID, locality, "", networkID)
 	return &model.WorkloadInstance{
 		Endpoint: &model.IstioEndpoint{
 			Address: addr,
 			// Not setting ports here as its done by k8s controller
 			Network: network.ID(we.Network),
 			Locality: model.Locality{
-				Label:     we.Locality,
+				Label:     locality,
 				ClusterID: clusterID,
 			},
 			LbWeight:  we.Weight,

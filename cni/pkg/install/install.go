@@ -20,88 +20,98 @@ import (
 	"os"
 	"path/filepath"
 	"sync/atomic"
-	"time"
 
 	"istio.io/istio/cni/pkg/config"
 	"istio.io/istio/cni/pkg/constants"
 	"istio.io/istio/cni/pkg/util"
 	"istio.io/istio/pkg/file"
-	"istio.io/istio/pkg/sleep"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/util/sets"
 )
 
-var installLog = log.RegisterScope("install", "CNI install", 0)
+var installLog = log.RegisterScope("install", "CNI install")
 
 type Installer struct {
 	cfg                *config.InstallConfig
 	isReady            *atomic.Value
-	saToken            string
 	kubeconfigFilepath string
 	cniConfigFilepath  string
-	saTokenFilepath    string
 }
 
 // NewInstaller returns an instance of Installer with the given config
 func NewInstaller(cfg *config.InstallConfig, isReady *atomic.Value) *Installer {
 	return &Installer{
-		cfg:             cfg,
-		isReady:         isReady,
-		saTokenFilepath: constants.ServiceAccountPath + "/token",
+		cfg:                cfg,
+		kubeconfigFilepath: filepath.Join(cfg.MountedCNINetDir, cfg.KubeconfigFilename),
+		isReady:            isReady,
 	}
 }
 
-func (in *Installer) install(ctx context.Context) (err error) {
-	if err = copyBinaries(
-		in.cfg.CNIBinSourceDir, in.cfg.CNIBinTargetDirs,
-		in.cfg.UpdateCNIBinaries, in.cfg.SkipCNIBinaries); err != nil {
+func (in *Installer) installAll(ctx context.Context) (sets.Set[string], error) {
+	// Install binaries
+	// Currently we _always_ do this, since the binaries do not live in a shared location
+	// and we harm no one by doing so.
+	copiedFiles, err := copyBinaries(in.cfg.CNIBinSourceDir, in.cfg.CNIBinTargetDirs)
+	if err != nil {
 		cniInstalls.With(resultLabel.Value(resultCopyBinariesFailure)).Increment()
-		return
+		return copiedFiles, fmt.Errorf("copy binaries: %v", err)
 	}
 
-	if in.saToken, err = readServiceAccountToken(in.saTokenFilepath); err != nil {
-		cniInstalls.With(resultLabel.Value(resultReadSAFailure)).Increment()
-		return
-	}
-
-	if in.kubeconfigFilepath, err = createKubeconfigFile(in.cfg, in.saToken); err != nil {
+	// Install kubeconfig (if needed) - we write/update this in the shared node CNI netdir,
+	// which may be watched by other CNIs, and so we don't want to trigger writes to this file
+	// unless it's missing or the contents are not what we expect.
+	if err := maybeWriteKubeConfigFile(in.cfg); err != nil {
 		cniInstalls.With(resultLabel.Value(resultCreateKubeConfigFailure)).Increment()
-		return
+		return copiedFiles, fmt.Errorf("write kubeconfig: %v", err)
 	}
 
-	if in.cniConfigFilepath, err = createCNIConfigFile(ctx, in.cfg, in.saToken); err != nil {
-		cniInstalls.With(resultLabel.Value(resultCreateCNIConfigFailure)).Increment()
-		return
+	// Install CNI netdir config (if needed) - we write/update this in the shared node CNI netdir,
+	// which may be watched by other CNIs, and so we don't want to trigger writes to this file
+	// unless it's missing or the contents are not what we expect.
+	if err := checkValidCNIConfig(in.cfg, in.cniConfigFilepath); err != nil {
+		installLog.Infof("missing (or invalid) configuration detected, (re)writing CNI config file at %s", in.cniConfigFilepath)
+		cfgPath, err := createCNIConfigFile(ctx, in.cfg)
+		if err != nil {
+			cniInstalls.With(resultLabel.Value(resultCreateCNIConfigFailure)).Increment()
+			return copiedFiles, fmt.Errorf("create CNI config file: %v", err)
+		}
+		in.cniConfigFilepath = cfgPath
+	} else {
+		installLog.Infof("valid Istio config present in node-level CNI file %s, not modifying", in.cniConfigFilepath)
 	}
 
-	return
+	return copiedFiles, nil
 }
 
 // Run starts the installation process, verifies the configuration, then sleeps.
-// If an invalid configuration is detected, the installation process will restart to restore a valid state.
-func (in *Installer) Run(ctx context.Context) (err error) {
-	if in.cfg.CNIEnableInstall {
-		if err = in.install(ctx); err != nil {
-			return
-		}
-		installLog.Info("Installation succeed, start watching for re-installation.")
-	} else {
-		installLog.Info("Skip installing CNI configuration and binaries.")
+// If the configuration is invalid, a full redeployal of config, binaries, and svcAcct credentials to the
+// shared node CNI dir will be attempted.
+//
+// If changes occurred but the config is still valid, only the binaries and (optionally) svcAcct credentials
+// will be redeployed.
+func (in *Installer) Run(ctx context.Context) error {
+	installedBins, err := in.installAll(ctx)
+	if err != nil {
+		return err
 	}
+	installLog.Info("Installation succeed, start watching for re-installation.")
 
 	for {
-		if err = in.sleepCheckInstall(ctx); err != nil {
-			return
+		// if sleepWatchInstall yields without error, that means the config might have been modified in some fashion.
+		// so we rerun `install`, which will update the modified config if it has fallen out of sync with
+		// our desired state
+		err := in.sleepWatchInstall(ctx, installedBins)
+		if err != nil {
+			installLog.Error("error watching node CNI config")
+			return err
 		}
-
-		installLog.Info("Detect changes to the CNI configuration and binaries, attempt reinstalling...")
-		if in.cfg.CNIEnableInstall && in.cfg.CNIEnableReinstall {
-			if err = in.install(ctx); err != nil {
-				return
-			}
-			installLog.Info("CNI configuration and binaries reinstalled.")
-		} else {
-			installLog.Info("Skip reinstalling CNI configuration and binaries.")
+		installLog.Info("Detected changes to the node-level CNI setup, checking to see if configs or binaries need redeploying")
+		// We don't support (or want) to silently (re)deploy any binaries that were not in the initial "snapshot"
+		// so we intentionally discard/do not update the list of installedBins on redeploys.
+		if _, err := in.installAll(ctx); err != nil {
+			return err
 		}
+		installLog.Info("Istio CNI configuration and binaries validated/reinstalled.")
 	}
 }
 
@@ -166,48 +176,55 @@ func (in *Installer) Cleanup() error {
 	return nil
 }
 
-func readServiceAccountToken(saToken string) (string, error) {
-	if !file.Exists(saToken) {
-		return "", fmt.Errorf("service account token file %s does not exist. Is this not running within a pod?", saToken)
+// sleepWatchInstall  blocks until any file change for the binaries or config are detected.
+// At that point, the func yields so the caller can recheck the validity of the install.
+// If an error occurs or context is canceled, the function will return an error.
+func (in *Installer) sleepWatchInstall(ctx context.Context, installedBinFiles sets.Set[string]) error {
+	// Watch our specific binaries, in each configured binary dir.
+	// We may or may not be the only CNI plugin in play, and if we are not
+	// we shouldn't fire events for binaries that are not ours.
+	var binPaths []string
+	for _, bindir := range in.cfg.CNIBinTargetDirs {
+		for _, binary := range installedBinFiles.UnsortedList() {
+			binPaths = append(binPaths, filepath.Join(bindir, binary))
+		}
 	}
-
-	token, err := os.ReadFile(saToken)
-	if err != nil {
-		return "", err
-	}
-
-	return string(token), nil
-}
-
-// sleepCheckInstall verifies the configuration then blocks until an invalid configuration is detected, and return nil.
-// If an error occurs or context is canceled, the function will return the error.
-// Returning from this function will set the pod to "NotReady".
-func (in *Installer) sleepCheckInstall(ctx context.Context) error {
+	targets := append(
+		binPaths,
+		in.cfg.MountedCNINetDir,
+		constants.ServiceAccountPath,
+	)
 	// Create file watcher before checking for installation
 	// so that no file modifications are missed while and after checking
-	watcher, fileModified, errChan, err := util.CreateFileWatcher(append(in.cfg.CNIBinTargetDirs, in.cfg.MountedCNINetDir)...)
+	// note: we create a file watcher for each invocation, otherwise when we write to the directories
+	// we would get infinite looping of events
+	//
+	// Additionally, fsnotify will lose existing watches on atomic copies (due to overwrite/rename),
+	// so we have to re-watch after re-copy to make sure we always have fresh watches.
+	watcher, err := util.CreateFileWatcher(targets...)
 	if err != nil {
 		return err
 	}
 	defer func() {
 		SetNotReady(in.isReady)
-		_ = watcher.Close()
+		watcher.Close()
 	}()
 
-	// Watch for service account token changes in background
-	in.watchSAToken(ctx, fileModified, errChan)
-
 	for {
-		if checkErr := checkInstall(in.cfg, in.cniConfigFilepath); checkErr != nil {
-			// Pod set to "NotReady" due to invalid configuration
-			installLog.Infof("Invalid configuration. %v", checkErr)
+		// Before we process whether any file events have been triggered, we must check that the file is correct
+		// at this moment, and if not, yield. This is to catch other CNIs which might have mutated the file between
+		// the (theoretical) window after we initially install/write, but before we actually start the filewatch.
+		if err := checkValidCNIConfig(in.cfg, in.cniConfigFilepath); err != nil {
 			return nil
 		}
-		// Check if file has been modified or if an error has occurred during checkInstall before setting isReady to true
+
+		// If a file we are watching has a change event, yield and let caller check validity
 		select {
-		case <-fileModified:
+		case <-watcher.Events:
+			// Something changed, and we must yield
 			return nil
-		case err := <-errChan:
+		case err := <-watcher.Errors:
+			// We had a watch error - that's no good
 			return err
 		case <-ctx.Done():
 			return ctx.Err()
@@ -216,17 +233,13 @@ func (in *Installer) sleepCheckInstall(ctx context.Context) error {
 			SetReady(in.isReady)
 			cniInstalls.With(resultLabel.Value(resultSuccess)).Increment()
 			// Pod set to "NotReady" before termination
-			return util.WaitForFileMod(ctx, fileModified, errChan)
+			return watcher.Wait(ctx)
 		}
 	}
 }
 
-// checkInstall returns an error if an invalid CNI configuration is detected
-func checkInstall(cfg *config.InstallConfig, cniConfigFilepath string) error {
-	// If the installation is skipped, don't check for invalid configurations.
-	if !cfg.CNIEnableInstall {
-		return nil
-	}
+// checkValidCNIConfig returns an error if an invalid CNI configuration is detected
+func checkValidCNIConfig(cfg *config.InstallConfig, cniConfigFilepath string) error {
 	defaultCNIConfigFilename, err := getDefaultCNINetwork(cfg.MountedCNINetDir)
 	if err != nil {
 		return err
@@ -278,28 +291,4 @@ func checkInstall(cfg *config.InstallConfig, cniConfigFilepath string) error {
 		return fmt.Errorf("istio-cni CNI config file modified: %s", cniConfigFilepath)
 	}
 	return nil
-}
-
-// watchSAToken periodically reads SA token file and compares its content with the token stored in the Installer.
-// Sends true into fileModified in case of mismatch.
-// Allows to detect changes in the Bound Service Account Token Volume.
-func (in *Installer) watchSAToken(ctx context.Context, fileModified chan bool, errChan chan error) {
-	curToken := in.saToken
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				token, err := readServiceAccountToken(in.saTokenFilepath)
-				if err != nil {
-					errChan <- err
-				}
-				if curToken != token {
-					fileModified <- true
-				}
-				sleep.UntilContext(ctx, 1*time.Minute)
-			}
-		}
-	}()
 }

@@ -161,16 +161,23 @@ spec:
     name: default.rewrite.1
     rewrite:
       authority: new.example.com
-      uri: '%FULLREPLACE()%/replacement'
+      uriRegexRewrite:
+        match: /.*
+        rewrite: /replacement
     route:
     - destination:
         host: httpbin.default.svc.domain.suffix
         port:
           number: 80
-  - mirror:
-      host: httpbin-mirror.default.svc.domain.suffix
-      port:
-        number: 80
+  - mirrors:
+    - destination:
+        host: httpbin-mirror.default.svc.domain.suffix
+        port:
+          number: 80
+    - destination:
+        host: httpbin-second.default.svc.domain.suffix
+        port:
+          number: 80
     name: default.mirror.0
     route:
     - destination:

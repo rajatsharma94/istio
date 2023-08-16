@@ -27,22 +27,13 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 
+	"istio.io/api/annotation"
 	"istio.io/istio/pilot/pkg/model"
-	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 )
-
-func hasProxyIP(addresses []v1.EndpointAddress, proxyIP string) bool {
-	for _, addr := range addresses {
-		if addr.IP == proxyIP {
-			return true
-		}
-	}
-	return false
-}
 
 func getLabelValue(metadata metav1.ObjectMeta, label string, fallBackLabel string) string {
 	metaLabels := metadata.GetLabels()
@@ -133,45 +124,8 @@ func getPodServices(allServices []*v1.Service, pod *v1.Pod) []*v1.Service {
 	return services
 }
 
-func portsEqual(a, b []v1.EndpointPort) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i].Name != b[i].Name || a[i].Port != b[i].Port || a[i].Protocol != b[i].Protocol ||
-			ptrValueOrEmpty(a[i].AppProtocol) != ptrValueOrEmpty(b[i].AppProtocol) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func addressesEqual(a, b []v1.EndpointAddress) bool {
-	if len(a) != len(b) {
-		return false
-	}
-
-	for i := range a {
-		if a[i].IP != b[i].IP || a[i].Hostname != b[i].Hostname ||
-			ptrValueOrEmpty(a[i].NodeName) != ptrValueOrEmpty(b[i].NodeName) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func ptrValueOrEmpty(ptr *string) string {
-	if ptr != nil {
-		return *ptr
-	}
-	return ""
-}
-
 func getNodeSelectorsForService(svc *v1.Service) labels.Instance {
-	if nodeSelector := svc.Annotations[kube.NodeSelectorAnnotation]; nodeSelector != "" {
+	if nodeSelector := svc.Annotations[annotation.TrafficNodeSelector.Name]; nodeSelector != "" {
 		var nodeSelectorKV map[string]string
 		if err := json.Unmarshal([]byte(nodeSelector), &nodeSelectorKV); err != nil {
 			log.Debugf("failed to unmarshal node selector annotation value for service %s.%s: %v",
@@ -190,7 +144,7 @@ func isNodePortGatewayService(svc *v1.Service) bool {
 	if svc == nil {
 		return false
 	}
-	_, ok := svc.Annotations[kube.NodeSelectorAnnotation]
+	_, ok := svc.Annotations[annotation.TrafficNodeSelector.Name]
 	return ok && svc.Spec.Type == v1.ServiceTypeNodePort
 }
 

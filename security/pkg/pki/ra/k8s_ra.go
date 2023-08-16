@@ -25,11 +25,11 @@ import (
 	clientset "k8s.io/client-go/kubernetes"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/security/pkg/k8s/chiron"
 	"istio.io/istio/security/pkg/pki/ca"
 	raerror "istio.io/istio/security/pkg/pki/error"
 	"istio.io/istio/security/pkg/pki/util"
-	"istio.io/pkg/log"
 )
 
 // KubernetesRA integrated with an external CA using Kubernetes CSR API
@@ -43,7 +43,7 @@ type KubernetesRA struct {
 	mutex sync.RWMutex
 }
 
-var pkiRaLog = log.RegisterScope("pkira", "Istiod RA log", 0)
+var pkiRaLog = log.RegisterScope("pkira", "Istiod RA log")
 
 // NewKubernetesRA : Create a RA that interfaces with K8S CSR CA
 func NewKubernetesRA(raOpts *IstioRAOptions) (*KubernetesRA, error) {
@@ -66,7 +66,7 @@ func (r *KubernetesRA) kubernetesSign(csrPEM []byte, caCertFile string, certSign
 ) ([]byte, error) {
 	certSignerDomain := r.certSignerDomain
 	if certSignerDomain == "" && certSigner != "" {
-		return nil, raerror.NewError(raerror.CertGenError, fmt.Errorf("certSignerDomain is requiered for signer %s", certSigner))
+		return nil, raerror.NewError(raerror.CertGenError, fmt.Errorf("certSignerDomain is required for signer %s", certSigner))
 	}
 	if certSignerDomain != "" && certSigner != "" {
 		certSigner = certSignerDomain + "/" + certSigner

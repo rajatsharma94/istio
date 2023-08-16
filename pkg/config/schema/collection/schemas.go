@@ -16,15 +16,15 @@ package collection
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/go-multierror"
-	"golang.org/x/exp/slices"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/schema/resource"
+	"istio.io/istio/pkg/slices"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // Schemas contains metadata about configuration resources.
@@ -105,6 +105,23 @@ func (s Schemas) Union(otherSchemas Schemas) Schemas {
 	for _, myschema := range otherSchemas.All() {
 		// an error indicates the schema has already been added, which doesn't negatively impact intersect
 		_ = resultBuilder.Add(myschema)
+	}
+	return resultBuilder.Build()
+}
+
+func (s Schemas) Intersect(otherSchemas Schemas) Schemas {
+	resultBuilder := NewSchemasBuilder()
+
+	schemaLookup := sets.String{}
+	for _, myschema := range s.All() {
+		schemaLookup.Insert(myschema.String())
+	}
+
+	// Only add schemas that are in both sets
+	for _, myschema := range otherSchemas.All() {
+		if schemaLookup.Contains(myschema.String()) {
+			_ = resultBuilder.Add(myschema)
+		}
 	}
 	return resultBuilder.Build()
 }
@@ -195,18 +212,13 @@ func (s Schemas) Remove(toRemove ...resource.Schema) Schemas {
 
 // Kinds returns all known resource kinds.
 func (s Schemas) Kinds() []string {
-	kinds := make(map[string]struct{}, len(s.byAddOrder))
+	kinds := sets.NewWithLength[string](len(s.byAddOrder))
 	for _, s := range s.byAddOrder {
-		kinds[s.Kind()] = struct{}{}
+		kinds.Insert(s.Kind())
 	}
 
-	out := make([]string, 0, len(kinds))
-	for kind := range kinds {
-		out = append(out, kind)
-	}
-
-	sort.Strings(out)
-	return out
+	out := kinds.UnsortedList()
+	return slices.Sort(out)
 }
 
 // Validate the schemas. Returns error if there is a problem.

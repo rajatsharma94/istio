@@ -17,7 +17,6 @@ package model
 import (
 	"fmt"
 
-	"google.golang.org/protobuf/proto"
 	"k8s.io/apimachinery/pkg/types"
 
 	networking "istio.io/api/networking/v1alpha3"
@@ -25,6 +24,7 @@ import (
 	"istio.io/istio/pkg/config/host"
 	"istio.io/istio/pkg/config/labels"
 	"istio.io/istio/pkg/config/visibility"
+	"istio.io/istio/pkg/util/sets"
 )
 
 // This function merges one or more destination rules for a given host string
@@ -77,16 +77,16 @@ func (ps *PushContext) mergeDestinationRule(p *consolidatedDestRules, destRuleCo
 			mdr.from = append(mdr.from, config.NamespacedName(destRuleConfig))
 			mergedRule := copied.Spec.(*networking.DestinationRule)
 
-			existingSubset := map[string]struct{}{}
+			existingSubset := sets.String{}
 			for _, subset := range mergedRule.Subsets {
-				existingSubset[subset.Name] = struct{}{}
+				existingSubset.Insert(subset.Name)
 			}
 			// we have an another destination rule for same host.
 			// concatenate both of them -- essentially add subsets from one to other.
 			// Note: we only add the subsets and do not overwrite anything else like exportTo or top level
 			// traffic policies if they already exist
 			for _, subset := range rule.Subsets {
-				if _, ok := existingSubset[subset.Name]; !ok {
+				if !existingSubset.Contains(subset.Name) {
 					// if not duplicated, append
 					mergedRule.Subsets = append(mergedRule.Subsets, subset)
 				} else {
@@ -117,44 +117,6 @@ func (ps *PushContext) mergeDestinationRule(p *consolidatedDestRules, destRuleCo
 	// DestinationRule does not exist for the resolved host so add it
 	destRules[resolvedHost] = append(destRules[resolvedHost], ConvertConsolidatedDestRule(&destRuleConfig))
 	p.exportTo[resolvedHost] = exportToMap
-}
-
-// inheritDestinationRule child config inherits settings from parent mesh/namespace
-func (ps *PushContext) inheritDestinationRule(parent, child *ConsolidatedDestRule) *ConsolidatedDestRule {
-	if parent == nil {
-		return child
-	}
-	if child == nil {
-		return parent
-	}
-
-	if parent.Equals(child) {
-		return parent
-	}
-
-	parentDR := parent.rule.Spec.(*networking.DestinationRule)
-	if parentDR.TrafficPolicy == nil {
-		return child
-	}
-
-	merged := parent.rule.DeepCopy()
-	// merge child into parent, child fields will overwrite parent's
-	proto.Merge(merged.Spec.(proto.Message), child.rule.Spec.(proto.Message))
-	merged.Meta = child.rule.Meta
-	merged.Status = child.rule.Status
-
-	childDR := child.rule.Spec.(*networking.DestinationRule)
-	// if parent has MUTUAL+certs/secret specified and child specifies SIMPLE, could break caCertificates
-	// if both parent and child specify TLS context, child's will be used only
-	if parentDR.TrafficPolicy.Tls != nil && (childDR.TrafficPolicy != nil && childDR.TrafficPolicy.Tls != nil) {
-		mergedDR := merged.Spec.(*networking.DestinationRule)
-		mergedDR.TrafficPolicy.Tls = childDR.TrafficPolicy.Tls.DeepCopy()
-	}
-	out := &ConsolidatedDestRule{}
-	out.rule = &merged
-	out.from = append(out.from, parent.from...)
-	out.from = append(out.from, child.from...)
-	return out
 }
 
 func ConvertConsolidatedDestRule(cfg *config.Config) *ConsolidatedDestRule {

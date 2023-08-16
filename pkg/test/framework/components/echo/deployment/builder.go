@@ -27,6 +27,7 @@ import (
 
 	"istio.io/istio/pkg/kube/inject"
 	"istio.io/istio/pkg/test"
+	"istio.io/istio/pkg/test/framework/components/ambient"
 	"istio.io/istio/pkg/test/framework/components/cluster"
 	"istio.io/istio/pkg/test/framework/components/echo"
 	"istio.io/istio/pkg/test/framework/components/echo/kube"
@@ -110,7 +111,7 @@ type builder struct {
 	// Only the first per-cluster entry for a given config should have a non-nil ref.
 	refs map[cluster.Kind][]*echo.Instance
 	// namespaces caches namespaces by their prefix; used for converting Static namespace from configs into actual
-	// namesapces
+	// namespaces
 	namespaces map[string]namespace.Instance
 	// the set of injection templates for each cluster
 	templates map[string]sets.String
@@ -285,6 +286,9 @@ func build(b builder) (out echo.Instances, err error) {
 	if out, err = b.deployInstances(); err != nil {
 		return
 	}
+	if err = b.deployWaypoints(out); err != nil {
+		return
+	}
 	return
 }
 
@@ -365,6 +369,28 @@ func (b builder) deployInstances() (instances echo.Instances, err error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+func (b builder) deployWaypoints(instances echo.Instances) error {
+	type waypoint struct{ ns, sa string }
+	waypoints := map[waypoint]namespace.Instance{}
+	for _, i := range instances {
+		if !i.Config().WaypointProxy {
+			continue
+		}
+		k := waypoint{i.NamespaceName(), i.Config().AccountName()}
+		waypoints[k] = i.Config().Namespace
+	}
+
+	errG := multierror.Group{}
+	for w, ns := range waypoints {
+		w, ns := w, ns
+		errG.Go(func() error {
+			_, err := ambient.NewWaypointProxy(b.ctx, ns, w.sa)
+			return err
+		})
+	}
+	return errG.Wait().ErrorOrNil()
 }
 
 func assignRefs(refs []*echo.Instance, instances echo.Instances) error {

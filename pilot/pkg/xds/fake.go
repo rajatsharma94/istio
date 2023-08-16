@@ -26,15 +26,14 @@ import (
 
 	endpoint "github.com/envoyproxy/go-control-plane/envoy/config/endpoint/v3"
 	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v3"
-	"golang.org/x/exp/slices"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
-	"sigs.k8s.io/yaml"
 
 	meshconfig "istio.io/api/mesh/v1alpha1"
 	"istio.io/istio/pilot/pkg/autoregistration"
@@ -47,7 +46,6 @@ import (
 	"istio.io/istio/pilot/pkg/networking/apigen"
 	"istio.io/istio/pilot/pkg/networking/core/v1alpha3"
 	"istio.io/istio/pilot/pkg/serviceregistry"
-	"istio.io/istio/pilot/pkg/serviceregistry/aggregate"
 	kube "istio.io/istio/pilot/pkg/serviceregistry/kube/controller"
 	memregistry "istio.io/istio/pilot/pkg/serviceregistry/memory"
 	"istio.io/istio/pilot/pkg/serviceregistry/util/xdsfake"
@@ -57,7 +55,6 @@ import (
 	"istio.io/istio/pkg/cluster"
 	"istio.io/istio/pkg/config"
 	"istio.io/istio/pkg/config/mesh"
-	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/config/schema/kind"
@@ -67,7 +64,6 @@ import (
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/util/retry"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/istio/tests/util"
 )
 
 type FakeOptions struct {
@@ -83,8 +79,6 @@ type FakeOptions struct {
 	KubernetesObjectStringByCluster map[cluster.ID]string
 	// If provided, the yaml string will be parsed and used as objects for the default cluster ("Kubernetes" or DefaultClusterName)
 	KubernetesObjectString string
-	// Endpoint mode for the Kubernetes service registry
-	KubernetesEndpointMode kube.EndpointMode
 	// If provided, these configs will be used directly
 	Configs []config.Config
 	// If provided, the yaml string will be parsed and used as configs
@@ -95,8 +89,6 @@ type FakeOptions struct {
 	MeshConfig      *meshconfig.MeshConfig
 	NetworksWatcher mesh.NetworksWatcher
 
-	// Callback to modify the server before it is started
-	DiscoveryServerModifier func(s *DiscoveryServer, m *memregistry.ServiceDiscovery)
 	// Callback to modify the kube client before it is started
 	KubeClientModifier func(c kubelib.Client)
 
@@ -134,8 +126,9 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	}
 
 	// Init with a dummy environment, since we have a circular dependency with the env creation.
-	s := NewDiscoveryServer(model.NewEnvironment(), "pilot-123", "", map[string]string{})
-	s.InitGenerators(s.Env, "istio-system", nil)
+	s := NewDiscoveryServer(model.NewEnvironment(), map[string]string{})
+	s.discoveryStartTime = time.Now()
+	s.InitGenerators(s.Env, "istio-system", "", nil)
 	t.Cleanup(func() {
 		s.JwtKeyResolver.Close()
 		s.pushQueue.ShutDown()
@@ -145,7 +138,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		pushReq := &model.PushRequest{
 			Full:           true,
 			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.ServiceEntry, Name: string(curr.Hostname), Namespace: curr.Attributes.Namespace}),
-			Reason:         []model.TriggerReason{model.ServiceUpdate},
+			Reason:         model.NewReasonStats(model.ServiceUpdate),
 		}
 		s.ConfigUpdate(pushReq)
 	}
@@ -161,7 +154,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		opts.NetworksWatcher.AddNetworksHandler(func() {
 			s.ConfigUpdate(&model.PushRequest{
 				Full:   true,
-				Reason: []model.TriggerReason{model.NetworksTrigger},
+				Reason: model.NewReasonStats(model.NetworksTrigger),
 			})
 		})
 	}
@@ -173,7 +166,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	s.Generators[v3.SecretType] = NewSecretGen(creds, s.Cache, opts.DefaultClusterName, nil)
 	s.Generators[v3.ExtensionConfigurationType].(*EcdsGenerator).SetCredController(creds)
 
-	configController := memory.NewSyncController(memory.MakeSkipValidation(collections.PilotGatewayAPI))
+	configController := memory.NewSyncController(memory.MakeSkipValidation(collections.PilotGatewayAPI()))
 	for k8sCluster, objs := range k8sObjects {
 		client := kubelib.NewFakeClientWithVersion(opts.KubernetesVersion, objs...)
 		if opts.KubeClientModifier != nil {
@@ -190,7 +183,6 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 			DomainSuffix:     "cluster.local",
 			XDSUpdater:       xdsUpdater,
 			NetworksWatcher:  opts.NetworksWatcher,
-			Mode:             opts.KubernetesEndpointMode,
 			SkipRun:          true,
 			ConfigController: k8sConfig,
 			ConfigCluster:    k8sCluster == opts.DefaultClusterName,
@@ -208,9 +200,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 			client.RunAndWait(stop)
 		}
 		registries = append(registries, k8s)
-		if err := creds.ClusterAdded(&multicluster.Cluster{ID: k8sCluster, Client: client}, stop); err != nil {
-			t.Fatal(err)
-		}
+		creds.ClusterAdded(&multicluster.Cluster{ID: k8sCluster, Client: client}, stop)
 	}
 
 	stop := test.NewStop(t)
@@ -226,12 +216,12 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		ConfigTemplateInput: opts.ConfigTemplateInput,
 		ConfigController:    configController,
 		MeshConfig:          m,
+		XDSUpdater:          xdsUpdater,
 		NetworksWatcher:     opts.NetworksWatcher,
 		ServiceRegistries:   registries,
-		PushContextLock:     &s.updateMutex,
 		ConfigStoreCaches:   []model.ConfigStoreController{ingr},
 		CreateConfigStore: func(c model.ConfigStoreController) model.ConfigStoreController {
-			g := gateway.NewController(defaultKubeClient, c, func(class config.GroupVersionKind, stop <-chan struct{}) bool {
+			g := gateway.NewController(defaultKubeClient, c, func(class schema.GroupVersionResource, stop <-chan struct{}) bool {
 				return true
 			}, nil, kube.Options{
 				DomainSuffix: "cluster.local",
@@ -244,8 +234,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		Services:  opts.Services,
 		Gateways:  opts.Gateways,
 	})
-	cg.ServiceEntryRegistry.AppendServiceHandler(serviceHandler)
-	s.updateMutex.Lock()
+	cg.Registry.AppendServiceHandler(serviceHandler)
 	s.Env = cg.Env()
 	s.Env.GatewayAPIController = gwc
 	if err := s.Env.InitNetworksManager(s); err != nil {
@@ -256,7 +245,6 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	s.debounceOptions.debounceAfter = opts.DebounceTime
 	memRegistry := cg.MemRegistry
 	memRegistry.XdsUpdater = s
-	s.updateMutex.Unlock()
 
 	// Setup config handlers
 	// TODO code re-use from server.go
@@ -264,13 +252,13 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		pushReq := &model.PushRequest{
 			Full:           true,
 			ConfigsUpdated: sets.New(model.ConfigKey{Kind: kind.MustFromGVK(curr.GroupVersionKind), Name: curr.Name, Namespace: curr.Namespace}),
-			Reason:         []model.TriggerReason{model.ConfigUpdate},
+			Reason:         model.NewReasonStats(model.ConfigUpdate),
 		}
 		s.ConfigUpdate(pushReq)
 	}
 	schemas := collections.Pilot.All()
 	if features.EnableGatewayAPI {
-		schemas = collections.PilotGatewayAPI.All()
+		schemas = collections.PilotGatewayAPI().All()
 	}
 	for _, schema := range schemas {
 		// This resource type was handled in external/servicediscovery.go, no need to rehandle here.
@@ -293,10 +281,6 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 		k8s.AppendWorkloadHandler(cg.ServiceEntryRegistry.WorkloadInstanceHandler)
 	}
 	s.WorkloadEntryController = autoregistration.NewController(cg.Store(), "test", keepalive.Infinity)
-
-	if opts.DiscoveryServerModifier != nil {
-		opts.DiscoveryServerModifier(s, memRegistry)
-	}
 
 	var listener net.Listener
 	if opts.ListenerBuilder != nil {
@@ -326,7 +310,7 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	cg.ServiceEntryRegistry.XdsUpdater = s
 	// Now that handlers are added, get everything started
 	cg.Run()
-	kubelib.WaitForCacheSync(stop,
+	kubelib.WaitForCacheSync("fake", stop,
 		cg.Registry.HasSynced,
 		cg.Store().HasSynced)
 	cg.ServiceEntryRegistry.ResyncEDS()
@@ -334,8 +318,6 @@ func NewFakeDiscoveryServer(t test.Failer, opts FakeOptions) *FakeDiscoveryServe
 	// Send an update. This ensures that even if there are no configs provided, the push context is
 	// initialized.
 	s.ConfigUpdate(&model.PushRequest{Full: true})
-
-	processStartTime = time.Now()
 
 	// Wait until initial updates are committed
 	c := s.InboundUpdates.Load()
@@ -367,9 +349,7 @@ func (f *FakeDiscoveryServer) KubeClient() kubelib.Client {
 }
 
 func (f *FakeDiscoveryServer) PushContext() *model.PushContext {
-	f.Discovery.updateMutex.RLock()
-	defer f.Discovery.updateMutex.RUnlock()
-	return f.Env().PushContext
+	return f.Env().PushContext()
 }
 
 // ConnectADS starts an ADS connection to the server. It will automatically be cleaned up when the test ends
@@ -476,73 +456,6 @@ func (f *FakeDiscoveryServer) EnsureSynced(t test.Failer) {
 	retry.UntilOrFail(t, func() bool {
 		return f.Discovery.CommittedUpdates.Load() >= c
 	}, retry.Delay(time.Millisecond))
-}
-
-// AssertEndpointConsistency compares endpointShards - which are incrementally updated - with
-// InstancesByPort, which rebuilds the same state from the ground up. This ensures the two are kept in sync;
-// out of sync fields typically are bugs.
-func (f *FakeDiscoveryServer) AssertEndpointConsistency() error {
-	f.t.Helper()
-	mock := &DiscoveryServer{
-		Env:   &model.Environment{EndpointIndex: model.NewEndpointIndex()},
-		Cache: model.DisabledCache{},
-	}
-	ag := f.Discovery.Env.ServiceDiscovery.(*aggregate.Controller)
-
-	for _, svc := range f.Discovery.Env.Services() {
-		for _, reg := range ag.GetRegistries() {
-			endpoints := make([]*model.IstioEndpoint, 0)
-			for _, port := range svc.Ports {
-				if port.Protocol == protocol.UDP {
-					continue
-				}
-
-				// This loses track of grouping (shards)
-				for _, inst := range reg.InstancesByPort(svc, port.Port) {
-					endpoints = append(endpoints, inst.Endpoint)
-				}
-			}
-
-			mock.EDSCacheUpdate(model.ShardKeyFromRegistry(reg), string(svc.Hostname), svc.Attributes.Namespace, endpoints)
-		}
-	}
-
-	// Normalize result for compare
-	sort := func(a, b *model.IstioEndpoint) bool {
-		if a.Address == b.Address {
-			return a.EndpointPort > b.EndpointPort
-		}
-		return a.Address > b.Address
-	}
-	haveShardz := f.Discovery.Env.EndpointIndex.Shardz()
-	for svc, ns := range haveShardz {
-		for _, shard := range ns {
-			// As an optimization, we will keep empty services around to avoid 0->1->0 scaling
-			if len(shard.Shards) == 0 {
-				delete(haveShardz, svc)
-			}
-			for _, s := range shard.Shards {
-				slices.SortFunc(s, sort)
-			}
-		}
-	}
-	wantShardz := mock.Env.EndpointIndex.Shardz()
-	for _, ns := range wantShardz {
-		for _, shard := range ns {
-			for _, s := range shard.Shards {
-				slices.SortFunc(s, sort)
-			}
-		}
-	}
-	have, _ := yaml.Marshal(haveShardz)
-	want, _ := yaml.Marshal(wantShardz)
-	if err := util.Compare(have, want); err != nil {
-		f.t.Logf("Endpoint Shards: %v", string(have))
-		f.t.Logf("Instances By Port: %v", string(want))
-		return err
-	}
-
-	return nil
 }
 
 func getKubernetesObjects(t test.Failer, opts FakeOptions) map[cluster.ID][]runtime.Object {

@@ -33,10 +33,6 @@ var (
 	// Description: Unhandled gateway port
 	GatewayPortNotOnWorkload = diag.NewMessageType(diag.Warning, "IST0104", "The gateway refers to a port that is not exposed on the workload (pod selector %s; port %d)")
 
-	// IstioProxyImageMismatch defines a diag.MessageType for message "IstioProxyImageMismatch".
-	// Description: The image of the Istio proxy running on the pod does not match the image defined in the injection configuration.
-	IstioProxyImageMismatch = diag.NewMessageType(diag.Warning, "IST0105", "The image of the Istio proxy running on the pod does not match the image defined in the injection configuration (pod image: %s; injection configuration image: %s). This often happens after upgrading the Istio control-plane and can be fixed by redeploying the pod.")
-
 	// SchemaValidationError defines a diag.MessageType for message "SchemaValidationError".
 	// Description: The resource has a schema validation error.
 	SchemaValidationError = diag.NewMessageType(diag.Error, "IST0106", "Schema validation error: %v")
@@ -73,10 +69,6 @@ var (
 	// Description: The resulting pods of a service mesh deployment can't be associated with multiple services using the same port but different protocols.
 	DeploymentAssociatedToMultipleServices = diag.NewMessageType(diag.Warning, "IST0116", "This deployment %s is associated with multiple services using port %d but different protocols: %v")
 
-	// DeploymentRequiresServiceAssociated defines a diag.MessageType for message "DeploymentRequiresServiceAssociated".
-	// Description: The resulting pods of a service mesh deployment must be associated with at least one service.
-	DeploymentRequiresServiceAssociated = diag.NewMessageType(diag.Warning, "IST0117", "No service associated with this deployment. Service mesh deployments must be associated with a service.")
-
 	// PortNameIsNotUnderNamingConvention defines a diag.MessageType for message "PortNameIsNotUnderNamingConvention".
 	// Description: Port name is not under naming convention. Protocol detection is applied to the port.
 	PortNameIsNotUnderNamingConvention = diag.NewMessageType(diag.Info, "IST0118", "Port name %s (port: %d, targetPort: %s) doesn't follow the naming convention of Istio port.")
@@ -90,8 +82,8 @@ var (
 	InvalidRegexp = diag.NewMessageType(diag.Warning, "IST0122", "Field %q regular expression invalid: %q (%s)")
 
 	// NamespaceMultipleInjectionLabels defines a diag.MessageType for message "NamespaceMultipleInjectionLabels".
-	// Description: A namespace has both new and legacy injection labels
-	NamespaceMultipleInjectionLabels = diag.NewMessageType(diag.Warning, "IST0123", "The namespace has both new and legacy injection labels. Run 'kubectl label namespace %s istio.io/rev-' or 'kubectl label namespace %s istio-injection-'")
+	// Description: A namespace has more than one type of injection labels
+	NamespaceMultipleInjectionLabels = diag.NewMessageType(diag.Warning, "IST0123", "The namespace has more than one type of injection labels %v, which may lead to undefined behavior. Make sure only one injection label exists.")
 
 	// InvalidAnnotation defines a diag.MessageType for message "InvalidAnnotation".
 	// Description: An Istio annotation that is not valid
@@ -236,6 +228,10 @@ var (
 	// MultipleTelemetriesWithoutWorkloadSelectors defines a diag.MessageType for message "MultipleTelemetriesWithoutWorkloadSelectors".
 	// Description: More than one telemetry resource in a namespace has no workload selector
 	MultipleTelemetriesWithoutWorkloadSelectors = diag.NewMessageType(diag.Error, "IST0160", "The Telemetries %v in namespace %q have no workload selector, which can lead to undefined behavior.")
+
+	// InvalidGatewayCredential defines a diag.MessageType for message "InvalidGatewayCredential".
+	// Description: The credential provided for the Gateway resource is invalid
+	InvalidGatewayCredential = diag.NewMessageType(diag.Error, "IST0161", "The credential referenced by the Gateway %s in namespace %s is invalid, which can cause the traffic not to work as expected.")
 )
 
 // All returns a list of all known message types.
@@ -247,7 +243,6 @@ func All() []*diag.MessageType {
 		NamespaceNotInjected,
 		PodMissingProxy,
 		GatewayPortNotOnWorkload,
-		IstioProxyImageMismatch,
 		SchemaValidationError,
 		MisplacedAnnotation,
 		UnknownAnnotation,
@@ -257,7 +252,6 @@ func All() []*diag.MessageType {
 		VirtualServiceDestinationPortSelectorRequired,
 		MTLSPolicyConflict,
 		DeploymentAssociatedToMultipleServices,
-		DeploymentRequiresServiceAssociated,
 		PortNameIsNotUnderNamingConvention,
 		JwtFailureDueToInvalidServicePortPrefix,
 		InvalidRegexp,
@@ -298,6 +292,7 @@ func All() []*diag.MessageType {
 		PodsIstioProxyImageMismatchInNamespace,
 		ConflictingTelemetryWorkloadSelectors,
 		MultipleTelemetriesWithoutWorkloadSelectors,
+		InvalidGatewayCredential,
 	}
 }
 
@@ -355,16 +350,6 @@ func NewGatewayPortNotOnWorkload(r *resource.Instance, selector string, port int
 		r,
 		selector,
 		port,
-	)
-}
-
-// NewIstioProxyImageMismatch returns a new diag.Message based on IstioProxyImageMismatch.
-func NewIstioProxyImageMismatch(r *resource.Instance, proxyImage string, injectionImage string) diag.Message {
-	return diag.NewMessage(
-		IstioProxyImageMismatch,
-		r,
-		proxyImage,
-		injectionImage,
 	)
 }
 
@@ -461,14 +446,6 @@ func NewDeploymentAssociatedToMultipleServices(r *resource.Instance, deployment 
 	)
 }
 
-// NewDeploymentRequiresServiceAssociated returns a new diag.Message based on DeploymentRequiresServiceAssociated.
-func NewDeploymentRequiresServiceAssociated(r *resource.Instance) diag.Message {
-	return diag.NewMessage(
-		DeploymentRequiresServiceAssociated,
-		r,
-	)
-}
-
 // NewPortNameIsNotUnderNamingConvention returns a new diag.Message based on PortNameIsNotUnderNamingConvention.
 func NewPortNameIsNotUnderNamingConvention(r *resource.Instance, portName string, port int, targetPort string) diag.Message {
 	return diag.NewMessage(
@@ -504,12 +481,11 @@ func NewInvalidRegexp(r *resource.Instance, where string, re string, problem str
 }
 
 // NewNamespaceMultipleInjectionLabels returns a new diag.Message based on NamespaceMultipleInjectionLabels.
-func NewNamespaceMultipleInjectionLabels(r *resource.Instance, namespace string, namespace2 string) diag.Message {
+func NewNamespaceMultipleInjectionLabels(r *resource.Instance, labels []string) diag.Message {
 	return diag.NewMessage(
 		NamespaceMultipleInjectionLabels,
 		r,
-		namespace,
-		namespace2,
+		labels,
 	)
 }
 
@@ -858,5 +834,15 @@ func NewMultipleTelemetriesWithoutWorkloadSelectors(r *resource.Instance, confli
 		r,
 		conflictingTelemetries,
 		namespace,
+	)
+}
+
+// NewInvalidGatewayCredential returns a new diag.Message based on InvalidGatewayCredential.
+func NewInvalidGatewayCredential(r *resource.Instance, gatewayName string, gatewayNamespace string) diag.Message {
+	return diag.NewMessage(
+		InvalidGatewayCredential,
+		r,
+		gatewayName,
+		gatewayNamespace,
 	)
 }

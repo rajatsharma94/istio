@@ -19,12 +19,11 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/exp/slices"
-
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pkg/cluster"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/test"
-	"istio.io/pkg/log"
 )
 
 // NewFakeXDS creates a XdsUpdater reporting events via a channel.
@@ -146,6 +145,8 @@ func (fx *Updater) RemoveShard(shardKey model.ShardKey) {
 
 func (fx *Updater) WaitOrFail(t test.Failer, et string) *Event {
 	t.Helper()
+	delay := time.NewTimer(time.Second * 5)
+	defer delay.Stop()
 	for {
 		select {
 		case e := <-fx.Events:
@@ -154,7 +155,7 @@ func (fx *Updater) WaitOrFail(t test.Failer, et string) *Event {
 			}
 			log.Infof("skipping event %q want %q", e.Type, et)
 			continue
-		case <-time.After(time.Second * 5):
+		case <-delay.C:
 			t.Fatalf("timed out waiting for %v", et)
 		}
 	}
@@ -174,7 +175,8 @@ func (fx *Updater) StrictMatchOrFail(t test.Failer, events ...Event) {
 
 func (fx *Updater) matchOrFail(t test.Failer, strict bool, events ...Event) {
 	t.Helper()
-
+	delay := time.NewTimer(time.Second * 5)
+	defer delay.Stop()
 	for {
 		if len(events) == 0 {
 			return
@@ -188,7 +190,7 @@ func (fx *Updater) matchOrFail(t test.Failer, strict bool, events ...Event) {
 					(want.Namespace == "" || want.Namespace == e.Namespace) &&
 					(want.EndpointCount == 0 || want.EndpointCount == len(e.Endpoints)) {
 					// Matched - delete event from desired
-					events = slices.Delete(events, i, i+1)
+					events = slices.Delete(events, i)
 					found = true
 					break
 				}
@@ -201,7 +203,7 @@ func (fx *Updater) matchOrFail(t test.Failer, strict bool, events ...Event) {
 				}
 			}
 			continue
-		case <-time.After(time.Second * 5):
+		case <-delay.C:
 			t.Fatalf("timed out waiting for %v", events)
 		}
 	}

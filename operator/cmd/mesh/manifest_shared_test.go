@@ -42,7 +42,7 @@ import (
 	"istio.io/istio/operator/pkg/util/clog"
 	"istio.io/istio/pkg/config/constants"
 	"istio.io/istio/pkg/kube"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
 )
 
 // cmdType is one of the commands used to generate and optionally apply a manifest.
@@ -350,11 +350,6 @@ func readFile(path string) (string, error) {
 // writeFile writes a file and returns an error if operation is unsuccessful.
 func writeFile(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o644)
-}
-
-// removeFile removes given file from provided path.
-func removeFile(path string) error {
-	return os.Remove(path)
 }
 
 // inFileAbsolutePath returns the absolute path for an input file like "gateways".

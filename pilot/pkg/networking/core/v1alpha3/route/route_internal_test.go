@@ -429,7 +429,58 @@ func TestMirrorPercent(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			mp := MirrorPercent(tt.route)
 			if !reflect.DeepEqual(mp, tt.want) {
-				t.Errorf("Unexpected mirro percent want %v, got %v", tt.want, mp)
+				t.Errorf("Unexpected mirror percent want %v, got %v", tt.want, mp)
+			}
+		})
+	}
+}
+
+func TestMirrorPercentByPolicy(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy *networking.HTTPMirrorPolicy
+		want   *core.RuntimeFractionalPercent
+	}{
+		{
+			name: "mirror with no value given",
+			policy: &networking.HTTPMirrorPolicy{
+				Destination: &networking.Destination{},
+			},
+			want: &core.RuntimeFractionalPercent{
+				DefaultValue: &xdstype.FractionalPercent{
+					Numerator:   100,
+					Denominator: xdstype.FractionalPercent_HUNDRED,
+				},
+			},
+		},
+		{
+			name: "zero mirror percentage",
+			policy: &networking.HTTPMirrorPolicy{
+				Destination: &networking.Destination{},
+				Percentage:  &networking.Percent{Value: 0.0},
+			},
+			want: nil,
+		},
+		{
+			name: "mirrorpercentage with actual percent",
+			policy: &networking.HTTPMirrorPolicy{
+				Destination: &networking.Destination{},
+				Percentage:  &networking.Percent{Value: 50.0},
+			},
+			want: &core.RuntimeFractionalPercent{
+				DefaultValue: &xdstype.FractionalPercent{
+					Numerator:   500000,
+					Denominator: xdstype.FractionalPercent_MILLION,
+				},
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			mp := MirrorPercentByPolicy(tt.policy)
+			if !reflect.DeepEqual(mp, tt.want) {
+				t.Errorf("Unexpected mirror percent want %v, got %v", tt.want, mp)
 			}
 		})
 	}
@@ -511,7 +562,7 @@ func TestTranslateMetadataMatch(t *testing.T) {
 			name: "request.auth.claims.",
 		},
 		{
-			name: "@request.auth.claims-",
+			name: "@request.auth.claims.",
 		},
 		{
 			name: "@request.auth.claims-abc",
@@ -543,6 +594,45 @@ func TestTranslateMetadataMatch(t *testing.T) {
 			name: "@request.auth.claims.regex",
 			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Regex{Regex: ".+?\\..+?\\..+?"}},
 			want: authz.MetadataMatcherForJWTClaims([]string{"regex"}, authzmatcher.StringMatcherRegex(".+?\\..+?\\..+?")),
+		},
+		{
+			name: "@request.auth.claims[key1",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+		},
+		{
+			name: "@request.auth.claims]key1",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+		},
+		{
+			// have `@request.auth.claims` prefix, but no separator
+			name: "@request.auth.claimskey1",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+		},
+		{
+			// if `.` exists, use `.` as separator
+			name: "@request.auth.claims.[key1]",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+			want: authz.MetadataMatcherForJWTClaims([]string{"[key1]"}, authzmatcher.StringMatcher("exact")),
+		},
+		{
+			name: "@request.auth.claims[key1]",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+			want: authz.MetadataMatcherForJWTClaims([]string{"key1"}, authzmatcher.StringMatcher("exact")),
+		},
+		{
+			name: "@request.auth.claims[key1][key2]",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+			want: authz.MetadataMatcherForJWTClaims([]string{"key1", "key2"}, authzmatcher.StringMatcher("exact")),
+		},
+		{
+			name: "@request.auth.claims[test-issuer-2@istio.io]",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+			want: authz.MetadataMatcherForJWTClaims([]string{"test-issuer-2@istio.io"}, authzmatcher.StringMatcher("exact")),
+		},
+		{
+			name: "@request.auth.claims[test-issuer-2@istio.io][key1]",
+			in:   &networking.StringMatch{MatchType: &networking.StringMatch_Exact{Exact: "exact"}},
+			want: authz.MetadataMatcherForJWTClaims([]string{"test-issuer-2@istio.io", "key1"}, authzmatcher.StringMatcher("exact")),
 		},
 	}
 	for _, tc := range cases {

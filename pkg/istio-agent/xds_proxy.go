@@ -49,12 +49,13 @@ import (
 	"istio.io/istio/pkg/istio-agent/health"
 	"istio.io/istio/pkg/istio-agent/metrics"
 	istiokeepalive "istio.io/istio/pkg/keepalive"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/network"
 	"istio.io/istio/pkg/uds"
 	"istio.io/istio/pkg/util/protomarshal"
 	"istio.io/istio/pkg/wasm"
 	"istio.io/istio/security/pkg/nodeagent/caclient"
 	"istio.io/istio/security/pkg/pki/util"
-	"istio.io/pkg/log"
 )
 
 const (
@@ -115,7 +116,7 @@ type XdsProxy struct {
 	istiodSAN             string
 }
 
-var proxyLog = log.RegisterScope("xdsproxy", "XDS Proxy in Istio Agent", 0)
+var proxyLog = log.RegisterScope("xdsproxy", "XDS Proxy in Istio Agent")
 
 const (
 	localHostIPv4 = "127.0.0.1"
@@ -288,7 +289,7 @@ type adsStream interface {
 	Context() context.Context
 }
 
-// StreamAggregatedResources is an implementation of XDS API API used for proxying between Istiod and Envoy.
+// StreamAggregatedResources is an implementation of XDS API used for proxying between Istiod and Envoy.
 // Every time envoy makes a fresh connection to the agent, we reestablish a new connection to the upstream xds
 // This ensures that a new connection between istiod and agent doesn't end up consuming pending messages from envoy
 // as the new connection may not go to the same istiod. Vice versa case also applies.
@@ -712,6 +713,9 @@ func (p *XdsProxy) tapRequest(req *discovery.DiscoveryRequest, timeout time.Dura
 	// Send to Istiod
 	connection.sendRequest(req)
 
+	delay := time.NewTimer(timeout)
+	defer delay.Stop()
+
 	// Wait for expected response or timeout
 	for {
 		select {
@@ -719,7 +723,7 @@ func (p *XdsProxy) tapRequest(req *discovery.DiscoveryRequest, timeout time.Dura
 			if res.TypeUrl == req.TypeUrl {
 				return res, nil
 			}
-		case <-time.After(timeout):
+		case <-delay.C:
 			return nil, nil
 		}
 	}
@@ -821,7 +825,7 @@ func (p *XdsProxy) initDebugInterface(port int) error {
 
 	go func() {
 		log.Infof("starting Http service at %s", listener.Addr())
-		if err := p.httpTapServer.Serve(listener); err != nil {
+		if err := p.httpTapServer.Serve(listener); network.IsUnexpectedListenerError(err) {
 			log.Errorf("error serving tap http server: %v", err)
 		}
 	}()

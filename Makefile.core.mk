@@ -35,10 +35,21 @@ ISTIO_GO := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 export ISTIO_GO
 SHELL := /bin/bash -o pipefail
 
-export VERSION ?= 1.18-dev
+# Version can be defined:
+# (1) in a $VERSION shell variable, which takes precedence; or
+# (2) in the VERSION file, in which we will append "-dev" to it
+ifeq ($(VERSION),)
+VERSION_FROM_FILE := $(shell cat VERSION)
+ifeq ($(VERSION_FROM_FILE),)
+$(error VERSION not detected. Make sure it's stored in the VERSION file or defined in VERSION variable)
+endif
+VERSION := $(VERSION_FROM_FILE)-dev
+endif
+
+export VERSION
 
 # Base version of Istio image to use
-BASE_VERSION ?= master-2023-03-21T19-01-24
+BASE_VERSION ?= master-2023-07-20T20-50-43
 ISTIO_BASE_REGISTRY ?= gcr.io/istio-release
 
 export GO111MODULE ?= on
@@ -214,13 +225,13 @@ STANDARD_BINARIES:=./istioctl/cmd/istioctl \
 # These are binaries that require Linux to build, and should
 # be skipped on other platforms. Notably this includes the current Linux-only Istio CNI plugin
 LINUX_AGENT_BINARIES:=./cni/cmd/istio-cni \
-  ./cni/cmd/istio-cni-taint \
-  ./cni/cmd/install-cni
+  ./cni/cmd/install-cni \
+  $(AGENT_BINARIES)
 
 BINARIES:=$(STANDARD_BINARIES) $(AGENT_BINARIES) $(LINUX_AGENT_BINARIES)
 
-# List of binaries included in releases
-RELEASE_BINARIES:=pilot-discovery pilot-agent istioctl bug-report
+# List of binaries that have their size tested
+RELEASE_SIZE_TEST_BINARIES:=pilot-discovery pilot-agent istioctl bug-report envoy ztunnel client server
 
 .PHONY: build
 build: depend ## Builds all go binaries.
@@ -234,7 +245,6 @@ build: depend ## Builds all go binaries.
 .PHONY: build-linux
 build-linux: depend
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ $(STANDARD_BINARIES)
-	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=agent $(AGENT_BINARIES)
 	GOOS=linux GOARCH=$(GOARCH_LOCAL) LDFLAGS=$(RELEASE_LDFLAGS) common/scripts/gobuild.sh $(TARGET_OUT_LINUX)/ -tags=agent $(LINUX_AGENT_BINARIES)
 
 # Create targets for TARGET_OUT_LINUX/binary
@@ -254,7 +264,6 @@ endif
 endef
 
 $(foreach bin,$(STANDARD_BINARIES),$(eval $(call build-linux,$(bin),"")))
-$(foreach bin,$(AGENT_BINARIES),$(eval $(call build-linux,$(bin),"agent")))
 $(foreach bin,$(LINUX_AGENT_BINARIES),$(eval $(call build-linux,$(bin),"agent")))
 
 # Create helper targets for each binary, like "pilot-discovery"
@@ -303,7 +312,6 @@ gen: \
 	update-crds \
 	proto \
 	copy-templates \
-	gen-kustomize \
 	gen-addons \
 	update-golden ## Update all generated code.
 
@@ -346,13 +354,6 @@ copy-templates:
 	# copy istio-discovery values, but apply some local customizations
 	cp manifests/charts/istio-control/istio-discovery/values.yaml manifests/charts/istiod-remote/
 	yq -i '.telemetry.enabled=false | .global.externalIstiod=true | .global.omitSidecarInjectorConfigMap=true | .pilot.configMap=false' manifests/charts/istiod-remote/values.yaml
-# Generate kustomize templates.
-gen-kustomize:
-	helm3 template istio --namespace istio-system --include-crds manifests/charts/base > manifests/charts/base/files/gen-istio-cluster.yaml
-	helm3 template istio --namespace istio-system manifests/charts/istio-control/istio-discovery \
-		> manifests/charts/istio-control/istio-discovery/files/gen-istio.yaml
-	helm3 template operator --namespace istio-operator manifests/charts/istio-operator \
-		--set hub=gcr.io/istio-testing --set tag=${VERSION} > manifests/charts/istio-operator/files/gen-operator.yaml
 
 #-----------------------------------------------------------------------------
 # Target: go build
@@ -381,7 +382,7 @@ ${TARGET_OUT}/release/_istioctl: ${LOCAL_OUT}/istioctl
 
 .PHONY: binaries-test
 binaries-test:
-	go test ${GOBUILDFLAGS} ./tests/binary/... -v --base-dir ${TARGET_OUT} --binaries="$(RELEASE_BINARIES)"
+	go test ${GOBUILDFLAGS} ./tests/binary/... -v --base-dir ${TARGET_OUT} --binaries="$(RELEASE_SIZE_TEST_BINARIES)"
 
 # istioctl-all makes all of the non-static istioctl executables for each supported OS
 .PHONY: istioctl-all
@@ -420,9 +421,10 @@ test: racetest ## Runs all unit tests
 # For now, keep a minimal subset. This can be expanded in the future.
 BENCH_TARGETS ?= ./pilot/...
 
+PKG ?= ./...
 .PHONY: racetest
 racetest: $(JUNIT_REPORT)
-	go test ${GOBUILDFLAGS} ${T} -race ./... 2>&1 | tee >($(JUNIT_REPORT) > $(JUNIT_OUT))
+	go test ${GOBUILDFLAGS} ${T} -race $(PKG) 2>&1 | tee >($(JUNIT_REPORT) > $(JUNIT_OUT))
 
 .PHONY: benchtest
 benchtest: $(JUNIT_REPORT) ## Runs all benchmarks
@@ -483,5 +485,22 @@ include tools/packaging/packaging.mk
 # Target: integration tests
 #-----------------------------------------------------------------------------
 include tests/integration/tests.mk
+
+#-----------------------------------------------------------------------------
+# Target: bookinfo sample
+#-----------------------------------------------------------------------------
+
+export BOOKINFO_VERSION ?= 1.18.0
+
+.PHONY: bookinfo.build bookinfo.push
+
+bookinfo.build:
+	@prow/buildx-create
+	@BOOKINFO_TAG=${BOOKINFO_VERSION} BOOKINFO_HUB=${HUB} samples/bookinfo/src/build-services.sh
+
+bookinfo.push: MULTI_ARCH=true
+bookinfo.push:
+	@prow/buildx-create
+	@BOOKINFO_TAG=${BOOKINFO_VERSION} BOOKINFO_HUB=${HUB} samples/bookinfo/src/build-services.sh --push
 
 include common/Makefile.common.mk

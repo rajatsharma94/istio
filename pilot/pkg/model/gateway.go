@@ -26,8 +26,8 @@ import (
 	"istio.io/istio/pkg/config/gateway"
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
+	"istio.io/istio/pkg/monitoring"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/pkg/monitoring"
 )
 
 // ServerPort defines port for the gateway server.
@@ -98,19 +98,14 @@ type MergedGateway struct {
 }
 
 var (
-	typeTag = monitoring.MustCreateLabel("type")
-	nameTag = monitoring.MustCreateLabel("name")
+	typeTag = monitoring.CreateLabel("type")
+	nameTag = monitoring.CreateLabel("name")
 
 	totalRejectedConfigs = monitoring.NewSum(
 		"pilot_total_rejected_configs",
 		"Total number of configs that Pilot had to reject or ignore.",
-		monitoring.WithLabels(typeTag, nameTag),
 	)
 )
-
-func init() {
-	monitoring.MustRegister(totalRejectedConfigs)
-}
 
 func RecordRejectedConfig(gatewayName string) {
 	totalRejectedConfigs.With(typeTag.Value("gateway"), nameTag.Value(gatewayName)).Increment()
@@ -352,9 +347,9 @@ func MergeGateways(gateways []gatewayWithInstances, proxy *Proxy, ps *PushContex
 	}
 }
 
-func udpSupportedPort(number uint32, instances []*ServiceInstance) bool {
+func udpSupportedPort(number uint32, instances []ServiceTarget) bool {
 	for _, w := range instances {
-		if int(number) == w.ServicePort.Port && w.ServicePort.Protocol == protocol.UDP {
+		if int(number) == w.Port.Port && w.Port.Protocol == protocol.UDP {
 			return true
 		}
 	}
@@ -367,8 +362,8 @@ func udpSupportedPort(number uint32, instances []*ServiceInstance) bool {
 // When legacyGatewaySelector=true things are a bit more complex, as we support referencing a Service
 // port and translating to the targetPort in addition to just directly referencing a port. In this
 // case, we just make a best effort guess by picking the first match.
-func resolvePorts(number uint32, instances []*ServiceInstance, legacyGatewaySelector bool) []uint32 {
-	ports := map[uint32]struct{}{}
+func resolvePorts(number uint32, instances []ServiceTarget, legacyGatewaySelector bool) []uint32 {
+	ports := sets.New[uint32]()
 	for _, w := range instances {
 		if _, disablePortTranslation := w.Service.Attributes.Labels[DisableGatewayPortTranslationLabel]; disablePortTranslation && legacyGatewaySelector {
 			// Skip this Service, they opted out of port translation
@@ -376,21 +371,18 @@ func resolvePorts(number uint32, instances []*ServiceInstance, legacyGatewaySele
 			// referencing the Service port, and references are un-ambiguous.
 			continue
 		}
-		if w.ServicePort.Port == int(number) && w.Endpoint != nil {
+		if w.Port.Port == int(number) {
 			if legacyGatewaySelector {
 				// When we are using legacy gateway label selection, we only resolve to a single port
 				// This has pros and cons; we don't allow merging of routes when it would be desirable, but
 				// we also avoid accidentally merging routes when we didn't intend to. While neither option is great,
 				// picking the first one here preserves backwards compatibility.
-				return []uint32{w.Endpoint.EndpointPort}
+				return []uint32{w.Port.TargetPort}
 			}
-			ports[w.Endpoint.EndpointPort] = struct{}{}
+			ports.Insert(w.Port.TargetPort)
 		}
 	}
-	ret := make([]uint32, 0, len(ports))
-	for p := range ports {
-		ret = append(ret, p)
-	}
+	ret := ports.UnsortedList()
 	if len(ret) == 0 && legacyGatewaySelector {
 		// When we are using legacy gateway label selection, we should bind to the port as-is if there is
 		// no matching ServiceInstance.
@@ -526,20 +518,20 @@ func sanitizeServerHostNamespace(server *networking.Server, namespace string) {
 	}
 }
 
-type GatewayPortMap map[int]map[int]struct{}
+type GatewayPortMap map[int]sets.Set[int]
 
 func getTargetPortMap(serversByRouteName map[string][]*networking.Server) GatewayPortMap {
 	pm := GatewayPortMap{}
 	for r, s := range serversByRouteName {
 		portNumber, _, _ := ParseGatewayRDSRouteName(r)
 		if _, f := pm[portNumber]; !f {
-			pm[portNumber] = map[int]struct{}{}
+			pm[portNumber] = sets.New[int]()
 		}
 		for _, se := range s {
 			if se.Port == nil {
 				continue
 			}
-			pm[portNumber][int(se.Port.Number)] = struct{}{}
+			pm[portNumber].Insert(int(se.Port.Number))
 		}
 	}
 	return pm

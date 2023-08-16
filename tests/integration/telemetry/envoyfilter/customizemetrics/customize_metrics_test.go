@@ -21,7 +21,6 @@ import (
 	_ "embed"
 	"encoding/base64"
 	"fmt"
-	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +36,6 @@ import (
 	"istio.io/istio/pkg/test/framework/components/registryredirector"
 	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/framework/resource"
-	"istio.io/istio/pkg/test/framework/resource/config/apply"
 	"istio.io/istio/pkg/test/util/retry"
 	util "istio.io/istio/tests/integration/telemetry"
 	"istio.io/istio/tests/integration/telemetry/common"
@@ -144,44 +142,9 @@ func TestCustomizeMetrics(t *testing.T) {
 			}
 			util.ValidateMetric(t, cluster, promInst, httpDestinationQuery, 1)
 			util.ValidateMetric(t, cluster, promInst, grpcDestinationQuery, 1)
-			// By default, envoy histogram has 20 buckets, testdata/bootstrap_patch.yaml change it to 10.
+			// By default, envoy histogram has 20 buckets, annotation changes it to 10
 			if err := common.ValidateBucket(cluster, promInst, "client", 10); err != nil {
 				t.Errorf("failed to validate bucket: %v", err)
-			}
-		})
-}
-
-// TestCustomGRPCMetrics tests that istio_[request/response]_messages_total are present https://github.com/istio/istio/issues/44144
-// Kiali depends on these metrics
-func TestCustomGRPCCountMetrics(t *testing.T) {
-	framework.NewTest(t).
-		Label(label.IPv4). // https://github.com/istio/istio/issues/35835
-		Features("observability.telemetry.stats.prometheus.customize-metric").
-		Run(func(t framework.TestContext) {
-			// Metrics to be queried and tested
-			metrics := [2]string{"istio_request_messages_total", "istio_response_messages_total"}
-			for _, metric := range metrics {
-				t.NewSubTestf(metric).Run(func(t framework.TestContext) {
-					t.Cleanup(func() {
-						if t.Failed() {
-							util.PromDump(t.Clusters().Default(), promInst, prometheus.Query{Metric: metric})
-						}
-						grpcSourceQuery := buildGRPCQuery(metric)
-						cluster := t.Clusters().Default()
-						retry.UntilSuccessOrFail(t, func() error {
-							if err := sendTraffic(); err != nil {
-								t.Log("failed to send grpc traffic")
-								return err
-							}
-							if _, err := util.QueryPrometheus(t, cluster, grpcSourceQuery, promInst); err != nil {
-								util.PromDiff(t, promInst, cluster, grpcSourceQuery)
-								return err
-							}
-							return nil
-						}, retry.Delay(1*time.Second), retry.Timeout(300*time.Second))
-						util.ValidateMetric(t, cluster, promInst, grpcSourceQuery, 1)
-					})
-				})
 			}
 		})
 }
@@ -196,14 +159,7 @@ func TestMain(m *testing.M) {
 		Run()
 }
 
-//go:embed testdata/bootstrap_patch.yaml
-var bootstrapPatch string
-
 func testSetup(ctx resource.Context) (err error) {
-	if err := ctx.ConfigIstio().YAML("istio-system", bootstrapPatch).Apply(apply.Wait); err != nil {
-		return err
-	}
-
 	registry, err = registryredirector.New(ctx, registryredirector.Config{Cluster: ctx.AllClusters().Default()})
 	if err != nil {
 		return
@@ -219,8 +175,9 @@ func testSetup(ctx resource.Context) (err error) {
 	}
 	proxyMetadata := fmt.Sprintf(`
 proxyMetadata:
-  BOOTSTRAP_XDS_AGENT: "true"
   WASM_INSECURE_REGISTRIES: %q`, registry.Address())
+
+	customBuckets := `{"istio":[1,5,10,50,100,500,1000,5000,10000]}`
 
 	echos, err := deployment.New(ctx).
 		WithClusters(ctx.Clusters()...).
@@ -234,6 +191,9 @@ proxyMetadata:
 						echo.SidecarProxyConfig: {
 							Value: proxyMetadata,
 						},
+						echo.SidecarStatsHistogramBuckets: {
+							Value: customBuckets,
+						},
 					},
 				},
 			},
@@ -246,6 +206,9 @@ proxyMetadata:
 					Annotations: map[echo.Annotation]*echo.AnnotationValue{
 						echo.SidecarProxyConfig: {
 							Value: proxyMetadata,
+						},
+						echo.SidecarStatsHistogramBuckets: {
+							Value: customBuckets,
 						},
 					},
 				},
@@ -289,16 +252,8 @@ func setupConfig(_ resource.Context, cfg *istio.Config) {
 
 func setupWasmExtension(ctx resource.Context) error {
 	proxySHA := "359dcd3a19f109c50e97517fe6b1e2676e870c4d"
-	attrGenURL := fmt.Sprintf("https://storage.googleapis.com/istio-build/proxy/attributegen-%v.wasm", proxySHA)
 	attrGenImageURL := fmt.Sprintf("oci://%v/istio-testing/wasm/attributegen:%v", registry.Address(), proxySHA)
-	useRemoteWasmModule := false
-	resp, err := http.Get(attrGenURL)
-	if err == nil && resp.StatusCode == http.StatusOK {
-		useRemoteWasmModule = true
-	}
-
 	args := map[string]any{
-		"WasmRemoteLoad":  useRemoteWasmModule,
 		"AttributeGenURL": attrGenImageURL,
 		"DockerConfigJson": base64.StdEncoding.EncodeToString(
 			[]byte(createDockerCredential(registryUser, registryPasswd, registry.Address()))),
@@ -400,22 +355,6 @@ func buildQuery(protocol string) (destinationQuery prometheus.Query) {
 
 	_, destinationQuery, _ = common.BuildQueryCommon(labels, appNsInst.Name())
 	return destinationQuery
-}
-
-func buildGRPCQuery(metric string) (destinationQuery prometheus.Query) {
-	labels := map[string]string{
-		"destination_app":                "server",
-		"destination_version":            "v1",
-		"destination_service":            "server." + appNsInst.Name() + ".svc.cluster.local",
-		"destination_service_name":       "server",
-		"destination_workload_namespace": appNsInst.Name(),
-		"destination_service_namespace":  appNsInst.Name(),
-	}
-	sourceQuery := prometheus.Query{}
-	sourceQuery.Metric = metric
-	sourceQuery.Labels = labels
-
-	return sourceQuery
 }
 
 func createDockerCredential(user, passwd, registry string) string {

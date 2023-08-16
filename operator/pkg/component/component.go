@@ -32,8 +32,8 @@ import (
 	"istio.io/istio/operator/pkg/patch"
 	"istio.io/istio/operator/pkg/tpath"
 	"istio.io/istio/operator/pkg/translate"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/util/sets"
-	"istio.io/pkg/log"
 )
 
 const (
@@ -42,7 +42,7 @@ const (
 	yamlCommentStr       = "#"
 )
 
-var scope = log.RegisterScope("installer", "installer", 0)
+var scope = log.RegisterScope("installer", "installer")
 
 // Options defines options for a component.
 type Options struct {
@@ -357,7 +357,7 @@ func renderManifest(cf *IstioComponentBase) (string, error) {
 }
 
 // createHelmRenderer creates a helm renderer for the component defined by c and returns a ptr to it.
-// If a helm subdir is not found in ComponentMap translations, it is assumed to be "addon/<component name>.
+// If a helm subdir is not found in ComponentMap translations, it is assumed to be "addon/<component name>".
 func createHelmRenderer(c *CommonComponentFields) helm.TemplateRenderer {
 	iop := c.InstallSpec
 	cns := string(c.ComponentName)

@@ -21,10 +21,10 @@ import (
 	"istio.io/istio/pilot/pkg/networking"
 	"istio.io/istio/pilot/pkg/security/authn"
 	"istio.io/istio/pilot/pkg/security/authn/factory"
-	"istio.io/pkg/log"
+	"istio.io/istio/pkg/log"
 )
 
-var authnLog = log.RegisterScope("authn", "authn debugging", 0)
+var authnLog = log.RegisterScope("authn", "authn debugging")
 
 type Builder struct {
 	applier      authn.PolicyApplier
@@ -125,8 +125,8 @@ func needPerPortPassthroughFilterChain(port uint32, node *model.Proxy) bool {
 	}
 
 	// If there is no Sidecar, check if the port is appearing in any service.
-	for _, si := range node.ServiceInstances {
-		if port == si.Endpoint.EndpointPort {
+	for _, si := range node.ServiceTargets {
+		if port == si.Port.TargetPort {
 			return false
 		}
 	}

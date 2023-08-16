@@ -36,7 +36,11 @@ func TestXFFGateway(t *testing.T) {
 		NewTest(t).
 		Features("traffic.ingress.topology").
 		Run(func(t framework.TestContext) {
-			gatewayNs := namespace.NewOrFail(t, t, namespace.Config{Prefix: "custom-gateway"})
+			inject := false
+			if t.Settings().Compatibility {
+				inject = true
+			}
+			gatewayNs := namespace.NewOrFail(t, t, namespace.Config{Prefix: "custom-gateway", Inject: inject})
 			injectLabel := `sidecar.istio.io/inject: "true"`
 			if len(t.Settings().Revisions.Default()) > 0 {
 				injectLabel = fmt.Sprintf(`istio.io/rev: "%v"`, t.Settings().Revisions.Default())
@@ -113,7 +117,11 @@ func TestProxyProtocolTCPGateway(t *testing.T) {
 		NewTest(t).
 		Features("traffic.ingress.topology").
 		Run(func(t framework.TestContext) {
-			gatewayNs := namespace.NewOrFail(t, t, namespace.Config{Prefix: "custom-gateway"})
+			inject := false
+			if t.Settings().Compatibility {
+				inject = true
+			}
+			gatewayNs := namespace.NewOrFail(t, t, namespace.Config{Prefix: "custom-gateway", Inject: inject})
 			injectLabel := `sidecar.istio.io/inject: "true"`
 			if len(t.Settings().Revisions.Default()) > 0 {
 				injectLabel = fmt.Sprintf(`istio.io/rev: "%v"`, t.Settings().Revisions.Default())
@@ -156,6 +164,7 @@ spec:
         proxy.istio.io/config: |
           gatewayTopology:
             numTrustedProxies: 1
+            proxyProtocol: {}
       labels:
         istio: ingressgateway
         {{ .injectLabel }}
@@ -177,32 +186,8 @@ spec:
 				return err
 			}, retry.Timeout(time.Minute*2), retry.Delay(time.Second))
 
-			t.NewSubTest("nofilter").Run(func(t framework.TestContext) {
-				for _, tt := range common.ProxyProtocolFilterNotAppliedGatewayCase(&apps, fmt.Sprintf("custom-gateway.%s.svc.cluster.local", gatewayNs.Name())) {
-					tt.Run(t, apps.Namespace.Name())
-				}
-			})
-
 			// Apply an envoy filter in a subtest to the existing gateway
 			t.NewSubTest("filter").Run(func(t framework.TestContext) {
-				t.ConfigIstio().Eval(gatewayNs.Name(), templateParams, `apiVersion: v1
-apiVersion: networking.istio.io/v1alpha3
-kind: EnvoyFilter
-metadata:
-  name: proxy-protocol
-spec:
-  configPatches:
-  - applyTo: LISTENER
-    patch:
-      operation: MERGE
-      value:
-        listener_filters:
-        - name: envoy.listener.proxy_protocol
-  workloadSelector:
-    labels:
-      istio: ingressgateway
----
-`).ApplyOrFail(t, apply.CleanupConditionally)
 				for _, tt := range common.ProxyProtocolFilterAppliedGatewayCase(&apps, fmt.Sprintf("custom-gateway.%s.svc.cluster.local", gatewayNs.Name())) {
 					tt.Run(t, apps.Namespace.Name())
 				}

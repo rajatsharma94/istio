@@ -94,6 +94,14 @@ spec:
           value: '[]'
         - name: ISTIO_META_APP_CONTAINERS
           value: ""
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        - name: GOMAXPROCS
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.cpu
         - name: ISTIO_META_CLUSTER_ID
           value: Kubernetes
         - name: ISTIO_META_NODE_NAME
@@ -102,6 +110,8 @@ spec:
               fieldPath: spec.nodeName
         - name: ISTIO_META_INTERCEPTION_MODE
           value: REDIRECT
+        - name: ISTIO_META_NETWORK
+          value: network-1
         - name: ISTIO_META_WORKLOAD_NAME
           value: default
         - name: ISTIO_META_OWNER

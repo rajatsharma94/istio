@@ -55,12 +55,12 @@ import (
 	"istio.io/istio/pkg/config/protocol"
 	"istio.io/istio/pkg/config/schema/gvk"
 	"istio.io/istio/pkg/istio-agent/grpcxds"
+	"istio.io/istio/pkg/log"
 	"istio.io/istio/pkg/test"
 	"istio.io/istio/pkg/test/echo/common"
 	echoproto "istio.io/istio/pkg/test/echo/proto"
 	"istio.io/istio/pkg/test/echo/server/endpoint"
 	"istio.io/istio/pkg/test/env"
-	"istio.io/pkg/log"
 )
 
 // Address of the test gRPC service, used in tests.
@@ -366,7 +366,7 @@ func initPersistent(sd *memory.ServiceDiscovery) {
 func initRBACTests(sd *memory.ServiceDiscovery, store model.ConfigStore, svcname string, port int, mtls bool) {
 	ns := "test"
 	hn := svcname + "." + ns + ".svc.cluster.local"
-	// The 'memory' store GetProxyServiceInstances uses the IP address of the node and endpoints to
+	// The 'memory' store GetProxyServiceTargets uses the IP address of the node and endpoints to
 	// identify the service. In k8s store, labels are matched instead.
 	// For server configs to work, the server XDS bootstrap must match the IP.
 	sd.AddService(&model.Service{
@@ -530,7 +530,7 @@ func testRBAC(t *testing.T, grpcServer *xdsgrpc.GRPCServer, xdsresolver resolver
 }
 
 // From xds_resolver_test
-// testClientConn is a fake implemetation of resolver.ClientConn. All is does
+// testClientConn is a fake implementation of resolver.ClientConn. All is does
 // is to store the state received from the resolver locally and signal that
 // event through a channel.
 type testClientConn struct {

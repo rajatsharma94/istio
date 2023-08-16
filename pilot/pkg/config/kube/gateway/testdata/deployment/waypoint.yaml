@@ -100,6 +100,14 @@ spec:
         - name: PROXY_CONFIG
           value: |
             {}
+        - name: GOMEMLIMIT
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.memory
+        - name: GOMAXPROCS
+          valueFrom:
+            resourceFieldRef:
+              resource: limits.cpu
         - name: ISTIO_META_CLUSTER_ID
           value: Kubernetes
         - name: ISTIO_META_INTERCEPTION_MODE
@@ -112,6 +120,13 @@ spec:
           value: cluster.local
         image: test/proxyv2:test
         name: istio-proxy
+        ports:
+        - containerPort: 15021
+          name: status-port
+          protocol: TCP
+        - containerPort: 15090
+          name: http-envoy-prom
+          protocol: TCP
         readinessProbe:
           failureThreshold: 4
           httpGet:
@@ -206,10 +221,15 @@ metadata:
     uid: ""
 spec:
   ports:
-  - appProtocol: https
-    name: https-hbone
+  - appProtocol: tcp
+    name: status-port
+    port: 15021
+    protocol: TCP
+  - appProtocol: all
+    name: mesh
     port: 15008
     protocol: TCP
   selector:
     istio.io/gateway-name: namespace
+  type: ClusterIP
 ---

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/hashicorp/go-multierror"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 
+	"istio.io/istio/istioctl/pkg/cli"
 	operator_istio "istio.io/istio/operator/pkg/apis/istio"
 	"istio.io/istio/operator/pkg/name"
 	"istio.io/istio/operator/pkg/util"
@@ -39,8 +41,10 @@ import (
 	"istio.io/istio/pkg/config/schema/collections"
 	"istio.io/istio/pkg/config/schema/resource"
 	"istio.io/istio/pkg/config/validation"
+	"istio.io/istio/pkg/kube/labels"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/slices"
 	"istio.io/istio/pkg/url"
-	"istio.io/pkg/log"
 )
 
 var (
@@ -57,11 +61,9 @@ Example resource specifications include:
 		"status":     {},
 	}
 
-	istioDeploymentLabel = []string{
-		"app",
-		"version",
-	}
 	serviceProtocolUDP = "UDP"
+
+	fileExtensions = []string{".json", ".yaml", ".yml"}
 )
 
 type validator struct{}
@@ -205,16 +207,14 @@ func (v *validator) validateDeploymentLabel(istioNamespace string, un *unstructu
 	if un.GetNamespace() == handleNamespace(istioNamespace) {
 		return nil
 	}
-	labels, err := GetTemplateLabels(un)
+	objLabels, err := GetTemplateLabels(un)
 	if err != nil {
 		return err
 	}
 	url := fmt.Sprintf("See %s\n", url.DeploymentRequirements)
-	for _, l := range istioDeploymentLabel {
-		if _, ok := labels[l]; !ok {
-			fmt.Fprintf(writer, "deployment %q may not provide Istio metrics and telemetry without label %q. "+url,
-				fmt.Sprintf("%s/%s:", un.GetName(), un.GetNamespace()), l)
-		}
+	if !labels.HasCanonicalServiceName(objLabels) || !labels.HasCanonicalServiceRevision(objLabels) {
+		fmt.Fprintf(writer, "deployment %q may not provide Istio metrics and telemetry labels: %q. "+url,
+			fmt.Sprintf("%s/%s:", un.GetName(), un.GetNamespace()), objLabels)
 	}
 	return nil
 }
@@ -266,6 +266,11 @@ func (v *validator) validateFile(istioNamespace *string, defaultNamespace string
 	}
 }
 
+func isFileFormatValid(file string) bool {
+	ext := filepath.Ext(file)
+	return slices.Contains(fileExtensions, ext)
+}
+
 func validateFiles(istioNamespace *string, defaultNamespace string, filenames []string, writer io.Writer) error {
 	if len(filenames) == 0 {
 		return errMissingFilename
@@ -273,18 +278,20 @@ func validateFiles(istioNamespace *string, defaultNamespace string, filenames []
 
 	v := &validator{}
 
-	var errs, err error
+	var errs error
 	var reader io.ReadCloser
 	warningsByFilename := map[string]validation.Warning{}
-	for _, filename := range filenames {
-		if filename == "-" {
+
+	processFile := func(path string) {
+		var err error
+		if path == "-" {
 			reader = io.NopCloser(os.Stdin)
 		} else {
-			reader, err = os.Open(filename)
-		}
-		if err != nil {
-			errs = multierror.Append(errs, fmt.Errorf("cannot read file %q: %v", filename, err))
-			continue
+			reader, err = os.Open(path)
+			if err != nil {
+				errs = multierror.Append(errs, fmt.Errorf("cannot read file %q: %v", path, err))
+				return
+			}
 		}
 		warning, err := v.validateFile(istioNamespace, defaultNamespace, reader, writer)
 		if err != nil {
@@ -292,9 +299,56 @@ func validateFiles(istioNamespace *string, defaultNamespace string, filenames []
 		}
 		err = reader.Close()
 		if err != nil {
-			log.Infof("file: %s is not closed: %v", filename, err)
+			log.Infof("file: %s is not closed: %v", path, err)
 		}
-		warningsByFilename[filename] = warning
+		warningsByFilename[path] = warning
+	}
+	processDirectory := func(directory string, processFile func(string)) error {
+		err := filepath.Walk(directory, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if info.IsDir() {
+				return nil
+			}
+
+			if isFileFormatValid(path) {
+				processFile(path)
+			}
+
+			return nil
+		})
+		return err
+	}
+
+	processedFiles := map[string]bool{}
+	for _, filename := range filenames {
+		var isDir bool
+		if filename != "-" {
+			fi, err := os.Stat(filename)
+			if err != nil {
+				errs = multierror.Append(errs, fmt.Errorf("cannot stat file %q: %v", filename, err))
+				continue
+			}
+			isDir = fi.IsDir()
+		}
+
+		if !isDir {
+			processFile(filename)
+			processedFiles[filename] = true
+			continue
+		}
+		if err := processDirectory(filename, func(path string) {
+			processFile(path)
+			processedFiles[path] = true
+		}); err != nil {
+			errs = multierror.Append(errs, err)
+		}
+	}
+	filenames = []string{}
+	for p := range processedFiles {
+		filenames = append(filenames, p)
 	}
 
 	if errs != nil {
@@ -331,7 +385,7 @@ func validateFiles(istioNamespace *string, defaultNamespace string, filenames []
 }
 
 // NewValidateCommand creates a new command for validating Istio k8s resources.
-func NewValidateCommand(istioNamespace *string, defaultNamespace *string) *cobra.Command {
+func NewValidateCommand(ctx cli.Context) *cobra.Command {
 	var filenames []string
 	var referential bool
 
@@ -345,6 +399,9 @@ func NewValidateCommand(istioNamespace *string, defaultNamespace *string) *cobra
   # Validate bookinfo-gateway.yaml with shorthand syntax
   istioctl v -f samples/bookinfo/networking/bookinfo-gateway.yaml
 
+  # Validate all yaml files under samples/bookinfo/networking directory
+  istioctl validate -f samples/bookinfo/networking
+
   # Validate current deployments under 'default' namespace within the cluster
   kubectl get deployments -o yaml | istioctl validate -f -
 
@@ -356,14 +413,16 @@ func NewValidateCommand(istioNamespace *string, defaultNamespace *string) *cobra
 `,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
-			return validateFiles(istioNamespace, *defaultNamespace, filenames, c.OutOrStderr())
+			istioNamespace := ctx.IstioNamespace()
+			defaultNamespace := ctx.NamespaceOrDefault("")
+			return validateFiles(&istioNamespace, defaultNamespace, filenames, c.OutOrStderr())
 		},
 	}
 
 	flags := c.PersistentFlags()
 	flags.StringSliceVarP(&filenames, "filename", "f", nil, "Inputs of files to validate")
 	flags.BoolVarP(&referential, "referential", "x", true, "Enable structural validation for policy and telemetry")
-
+	_ = flags.MarkHidden("referential")
 	return c
 }
 

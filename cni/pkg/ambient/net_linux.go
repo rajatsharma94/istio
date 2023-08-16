@@ -33,6 +33,7 @@ import (
 
 	"istio.io/istio/cni/pkg/ambient/constants"
 	ebpf "istio.io/istio/cni/pkg/ebpf/server"
+	"istio.io/istio/pkg/util/sets"
 )
 
 func IsPodInIpset(pod *corev1.Pod) bool {
@@ -170,7 +171,7 @@ func (s *Server) updatePodEbpfOnNode(pod *corev1.Pod) error {
 	return nil
 }
 
-func (s *Server) delPodEbpfOnNode(ip string) error {
+func (s *Server) delPodEbpfOnNode(ip string, force bool) error {
 	if s.ebpfServer == nil {
 		return fmt.Errorf("uninitialized ebpf server")
 	}
@@ -192,6 +193,9 @@ func (s *Server) delPodEbpfOnNode(ip string) error {
 		ifIndex = veth.Attrs().Index
 	}
 
+	if force {
+		return s.ebpfServer.RemovePod([]netip.Addr{ipAddr}, uint32(ifIndex))
+	}
 	args := &ebpf.RedirectArgs{
 		IPAddrs:   []netip.Addr{ipAddr},
 		Ifindex:   ifIndex,
@@ -327,7 +331,7 @@ func getPeerIndex(veth *netlink.Veth) (int, error) {
 }
 
 // CreateRulesOnNode initializes the routing, firewall and ipset rules on the node.
-func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS bool) error {
+func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS bool, geneveDstPort uint16) error {
 	var err error
 
 	log.Debugf("CreateRulesOnNode: ztunnelVeth=%s, ztunnelIP=%s", ztunnelVeth, ztunnelIP)
@@ -452,6 +456,19 @@ func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS boo
 			"--mark", constants.OutboundMark,
 			"-j", "ACCEPT",
 		),
+
+		// If we have an outbound mark, we don't need kube-proxy to do anything,
+		// so accept it before the KUBE-SERVICES chain in the Filter table rejects
+		// destinations that do not have a k8s endpoint resource. This is necessary
+		// for traffic destined to workloads outside k8s whose endpoints are known
+		// to ZTunnel but for whom k8s endpoints resources do not exist.
+		newIptableRule(
+			constants.TableFilter,
+			constants.ChainZTunnelForward,
+			"-m", "mark",
+			"--mark", constants.OutboundMark,
+			"-j", "ACCEPT",
+		),
 	}
 
 	if captureDNS {
@@ -477,7 +494,7 @@ func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS boo
 			constants.ChainZTunnelPrerouting,
 			"-p", "udp",
 			"-m", "udp",
-			"--dport", "6081",
+			"--dport", fmt.Sprintf("%d", geneveDstPort),
 			"-j", "RETURN",
 		),
 
@@ -610,8 +627,9 @@ func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS boo
 		LinkAttrs: netlink.LinkAttrs{
 			Name: constants.InboundTun,
 		},
-		ID:     1000,
+		ID:     constants.InboundTunVNI,
 		Remote: net.ParseIP(ztunnelIP),
+		Dport:  geneveDstPort,
 	}
 	log.Debugf("Building inbound tunnel: %+v", inbnd)
 	err = netlink.LinkAdd(inbnd)
@@ -632,8 +650,9 @@ func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS boo
 		LinkAttrs: netlink.LinkAttrs{
 			Name: constants.OutboundTun,
 		},
-		ID:     1001,
+		ID:     constants.OutboundTunVNI,
 		Remote: net.ParseIP(ztunnelIP),
+		Dport:  geneveDstPort,
 	}
 	log.Debugf("Building outbound tunnel: %+v", outbnd)
 	err = netlink.LinkAdd(outbnd)
@@ -758,11 +777,53 @@ func (s *Server) CreateRulesOnNode(ztunnelVeth, ztunnelIP string, captureDNS boo
 	for _, route := range routes {
 		err = execute(route.Cmd, route.Args...)
 		if err != nil {
-			log.Errorf(fmt.Errorf("failed to add route (%+v): %v", route, err))
+			log.Errorf("failed to add route (%+v): %v", route, err)
 		}
 	}
 
 	return nil
+}
+
+// determineDstPortForGeneveLink looks for first available destination port for given VNI and remote IP
+// starting from the default value 6081 (https://man7.org/linux/man-pages/man8/ip-link.8.html).
+// Destination port cannot be reused and must be dynamically determined when:
+// - an external geneve link already exists (external geneve link does not have ID and remote IP address);
+// - a geneve link with the same ID and remote IP already exist.
+func determineDstPortForGeneveLink(remoteIP net.IP, vnis ...uint32) uint16 {
+	defaultGenevePort := uint16(6081)
+	vniSet := sets.New[uint32](vnis...)
+
+	existingLinks, err := netlink.LinkList()
+	if err != nil {
+		log.Errorf("failed to list links on the node: %v", err)
+		return defaultGenevePort
+	}
+
+	isExternal := func(genveLink *netlink.Geneve) bool {
+		return genveLink.ID == 0 && genveLink.Remote == nil
+	}
+	isConfigurationReserved := func(geneveLink *netlink.Geneve) bool {
+		return vniSet.Contains(geneveLink.ID) && geneveLink.Remote.Equal(remoteIP)
+	}
+
+	geneveType := netlink.Geneve{}
+	reservedPorts := sets.New[uint16]()
+	for _, l := range existingLinks {
+		if l.Type() == geneveType.Type() {
+			geneveLink := l.(*netlink.Geneve)
+			if isExternal(geneveLink) || isConfigurationReserved(geneveLink) {
+				reservedPorts.Insert(geneveLink.Dport)
+			}
+		}
+	}
+
+	for {
+		if reservedPorts.Contains(defaultGenevePort) {
+			defaultGenevePort++
+		} else {
+			return defaultGenevePort
+		}
+	}
 }
 
 // CreateEBPFRulesInNodeProxyNS initializes the routes and iptable rules that need to exist WITHIN
@@ -785,7 +846,7 @@ func (s *Server) CreateEBPFRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP,
 		deleteIPRules([]string{strconv.Itoa(constants.TProxyMarkPriority), strconv.Itoa(constants.OrgSrcPriority)}, false)
 
 		// Set up tproxy marks
-		err := addTProxyMarks()
+		err := addTProxyMarkRule()
 		if err != nil {
 			return fmt.Errorf("failed to add TPROXY mark rules: %v", err)
 		}
@@ -818,79 +879,9 @@ func (s *Server) CreateEBPFRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP,
 			}
 		}
 
-		// Flush prerouting table - this should be a new pod netns and it should be clean, but just to be safe..
-		err = execute(s.IptablesCmd(), "-t", "mangle", "-F", "PREROUTING")
-		if err != nil {
-			return fmt.Errorf("failed to configure iptables rule: %v", err)
-		}
-
-		// Logging for prerouting mangle
-		err = execute(s.IptablesCmd(), "-t", "mangle", "-I", "PREROUTING", "-j", "LOG", "--log-prefix", "ztunnel mangle pre")
-		if err != nil {
-			return fmt.Errorf("failed to configure iptables rule: %v", err)
-		}
-
 		vethLink, err := netlink.LinkByIndex(proxyNsVethIdx)
 		if err != nil {
 			return fmt.Errorf("failed to find veth with index '%d' within namespace %s: %v", proxyNsVethIdx, ztunnelNetNS, err)
-		}
-
-		// Set up append rules
-		appendRules := []*iptablesRule{
-			// Set eBPF mark on inbound packets
-			newIptableRule(
-				constants.TableMangle,
-				"PREROUTING",
-				"-p", "tcp",
-				"-m", "mark",
-				"--mark", constants.EBPFInboundMark,
-				"-m", "tcp",
-				"--dport", fmt.Sprintf("%d", constants.ZtunnelInboundPort),
-				"-j", "TPROXY",
-				"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
-				"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPort),
-				"--on-ip", "127.0.0.1",
-			),
-			// Same mark, but on plaintext port
-			newIptableRule(
-				constants.TableMangle,
-				"PREROUTING",
-				"-p", "tcp",
-				"-m", "mark",
-				"--mark", constants.EBPFInboundMark,
-				"-j", "TPROXY",
-				"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
-				"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPlaintextPort),
-				"--on-ip", "127.0.0.1",
-			),
-			// Set outbound eBPF mark
-			newIptableRule(
-				constants.TableMangle,
-				"PREROUTING",
-				"-p", "tcp",
-				"-m", "mark",
-				"--mark", constants.EBPFOutboundMark,
-				"-j", "TPROXY",
-				"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
-				"--on-port", fmt.Sprintf("%d", constants.ZtunnelOutboundPort),
-				"--on-ip", "127.0.0.1",
-			),
-			// For anything NOT going to the ztunnel IP, add the OrgSrcRet mark
-			newIptableRule(
-				constants.TableMangle,
-				"PREROUTING",
-				"-p", "tcp",
-				"-i", vethLink.Attrs().Name,
-				"!",
-				"--dst", ztunnelIP,
-				"-j", "MARK",
-				"--set-mark", fmt.Sprintf("0x%x", constants.OrgSrcRetMark)+"/"+fmt.Sprintf("0x%x", constants.OrgSrcRetMask),
-			),
-		}
-
-		err = s.iptablesAppend(appendRules)
-		if err != nil {
-			log.Errorf("failed to append iptables rule: %v", err)
 		}
 
 		err = disableRPFiltersForLink(vethLink.Attrs().Name)
@@ -898,10 +889,85 @@ func (s *Server) CreateEBPFRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP,
 			log.Warnf("failed to disable procfs rp_filter for device %s: %v", vethLink.Attrs().Name, err)
 		}
 
-		return nil
+		if ebpf.EBPFTProxySupport() {
+			return nil
+		}
+		log.Infof("Current kernel doesn't support tproxy in eBPF, fall back to iptables tproxy rules")
+		return s.createTProxyRulesForLegacyEBPF(ztunnelIP, vethLink.Attrs().Name)
 	})
 	if err != nil {
 		return fmt.Errorf("failed to configure ztunnel ebpf from within ns(%s): %v", ns, err)
+	}
+
+	return nil
+}
+
+func (s *Server) createTProxyRulesForLegacyEBPF(ztunnelIP, ifName string) error {
+	err := addOrgSrcMarkRule()
+	if err != nil {
+		return fmt.Errorf("failed to add OrgSrc mark rules: %v", err)
+	}
+
+	// Flush prerouting table - this should be a new pod netns and it should be clean, but just to be safe..
+	err = execute(s.IptablesCmd(), "-t", "mangle", "-F", "PREROUTING")
+	if err != nil {
+		return fmt.Errorf("failed to configure iptables rule: %v", err)
+	}
+
+	// Set up append rules
+	appendRules := []*iptablesRule{
+		// Set eBPF mark on inbound packets
+		newIptableRule(
+			constants.TableMangle,
+			"PREROUTING",
+			"-p", "tcp",
+			"-m", "mark",
+			"--mark", constants.EBPFInboundMark,
+			"-m", "tcp",
+			"--dport", fmt.Sprintf("%d", constants.ZtunnelInboundPort),
+			"-j", "TPROXY",
+			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
+			"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPort),
+			"--on-ip", "127.0.0.1",
+		),
+		// Same mark, but on plaintext port
+		newIptableRule(
+			constants.TableMangle,
+			"PREROUTING",
+			"-p", "tcp",
+			"-m", "mark",
+			"--mark", constants.EBPFInboundMark,
+			"-j", "TPROXY",
+			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
+			"--on-port", fmt.Sprintf("%d", constants.ZtunnelInboundPlaintextPort),
+			"--on-ip", "127.0.0.1",
+		),
+		// Set outbound eBPF mark
+		newIptableRule(
+			constants.TableMangle,
+			"PREROUTING",
+			"-p", "tcp",
+			"-m", "mark",
+			"--mark", constants.EBPFOutboundMark,
+			"-j", "TPROXY",
+			"--tproxy-mark", fmt.Sprintf("0x%x", constants.TProxyMark)+"/"+fmt.Sprintf("0x%x", constants.TProxyMask),
+			"--on-port", fmt.Sprintf("%d", constants.ZtunnelOutboundPort),
+			"--on-ip", "127.0.0.1",
+		),
+		// For anything NOT going to the ztunnel IP, add the OrgSrcRet mark
+		newIptableRule(
+			constants.TableMangle,
+			"PREROUTING",
+			"-p", "tcp",
+			"-i", ifName,
+			"!",
+			"--dst", ztunnelIP,
+			"-j", "MARK",
+			"--set-mark", fmt.Sprintf("0x%x", constants.OrgSrcRetMark)+"/"+fmt.Sprintf("0x%x", constants.OrgSrcRetMask),
+		),
+	}
+	if err := s.iptablesAppend(appendRules); err != nil {
+		return fmt.Errorf("failed to append iptables rule: %v", err)
 	}
 
 	return nil
@@ -913,7 +979,7 @@ func (s *Server) CreateEBPFRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP,
 //
 // There is no cleanup required for things we do within the netns, as when the netns is destroyed on pod delete,
 // everything within the netns goes away.
-func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztunnelNetNS, hostIP string) error {
+func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztunnelNetNS, hostIP string, geneveDstPort uint16) error {
 	ns := filepath.Base(ztunnelNetNS)
 	log.Debugf("CreateRulesWithinNodeProxyNS: proxyNsVethIdx=%d, ztunnelIP=%s, hostIP=%s, from within netns=%s", proxyNsVethIdx, ztunnelIP, hostIP, ztunnelNetNS)
 	err := netns.WithNetNSPath(fmt.Sprintf("/var/run/netns/%s", ns), func(netns.NetNS) error {
@@ -936,8 +1002,9 @@ func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztu
 			LinkAttrs: netlink.LinkAttrs{
 				Name: inboundGeneveLinkName,
 			},
-			ID:     1000,
+			ID:     constants.InboundTunVNI,
 			Remote: net.ParseIP(hostIP),
+			Dport:  geneveDstPort,
 		}
 		log.Debugf("Building inbound tunnel: %+v", inbndTunLink)
 		err := netlink.LinkAdd(inbndTunLink)
@@ -959,8 +1026,9 @@ func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztu
 			LinkAttrs: netlink.LinkAttrs{
 				Name: outboundGeneveLinkName,
 			},
-			ID:     1001,
+			ID:     constants.OutboundTunVNI,
 			Remote: net.ParseIP(hostIP),
+			Dport:  geneveDstPort,
 		}
 		log.Debugf("Building outbound tunnel: %+v", outbndTunLink)
 		err = netlink.LinkAdd(outbndTunLink)
@@ -1004,9 +1072,13 @@ func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztu
 		}
 
 		// Set up tproxy marks
-		err = addTProxyMarks()
+		err = addTProxyMarkRule()
 		if err != nil {
 			return fmt.Errorf("failed to add TPROXY mark rules: %v", err)
+		}
+		err = addOrgSrcMarkRule()
+		if err != nil {
+			return fmt.Errorf("failed to add OrgSrc mark rules: %v", err)
 		}
 
 		loopbackLink, err := netlink.LinkByName("lo")
@@ -1186,29 +1258,61 @@ func (s *Server) CreateRulesWithinNodeProxyNS(proxyNsVethIdx int, ztunnelIP, ztu
 	return nil
 }
 
-func (s *Server) cleanupNode() {
-	log.Infof("Node-level network rule cleanup started")
-	if s.redirectMode == EbpfMode {
+func (s *Server) ztunnelDown() {
+	switch s.redirectMode {
+	case EbpfMode:
 		if err := s.delZtunnelEbpfOnNode(); err != nil {
 			log.Error(err)
 		}
-		return
-	}
-	s.cleanRules()
-
-	flushAllRouteTables()
-
-	deleteIPRules([]string{"100", "101", "102", "103"}, true)
-
-	deleteTunnelLinks(constants.InboundTun, constants.OutboundTun, true)
-
-	err := Ipset.DestroySet()
-	if err != nil {
-		log.Warnf("unable to delete IPSet: %v", err)
+	case IptablesMode:
+		// nothing to do with IptablesMode
 	}
 }
 
-func addTProxyMarks() error {
+// Cleans up EVERYTHING on the node.
+func (s *Server) cleanupNode() {
+	log.Infof("Node-level network rule cleanup started")
+	defer log.Infof("Node-level cleanup done")
+	log.Infof("If rules do not exist in the first place, warnings will be triggered - these can be safely ignored")
+	switch s.redirectMode {
+	case EbpfMode:
+		if err := s.cleanupPodsEbpfOnNode(); err != nil {
+			log.Errorf("%v", err)
+		}
+	case IptablesMode:
+		s.cleanRules()
+
+		flushAllRouteTables()
+
+		deleteIPRules([]string{"100", "101", "102", "103"}, true)
+
+		deleteTunnelLinks(constants.InboundTun, constants.OutboundTun, true)
+
+		err := Ipset.DestroySet()
+		if err != nil {
+			log.Warnf("unable to delete IPSet: %v", err)
+		}
+	}
+}
+
+func (s *Server) getEnrolledIPSets() sets.Set[string] {
+	pods := sets.New[string]()
+	switch s.redirectMode {
+	case IptablesMode:
+		l, err := Ipset.List()
+		if err != nil {
+			log.Warnf("unable to list IPSet: %v", err)
+		}
+		for _, v := range l {
+			pods.Insert(v.IP.String())
+		}
+	case EbpfMode:
+		pods = s.ebpfServer.DumpAppIPs()
+	}
+	return pods
+}
+
+func addTProxyMarkRule() error {
 	// Set up tproxy marks
 	var rules []*netlink.Rule
 	// TODO IPv6, append  unix.AF_INET6
@@ -1222,7 +1326,24 @@ func addTProxyMarks() error {
 		tproxMarkRule.Mask = constants.TProxyMask
 		tproxMarkRule.Priority = constants.TProxyMarkPriority
 		rules = append(rules, tproxMarkRule)
+	}
 
+	for _, rule := range rules {
+		log.Debugf("Adding netlink rule : %+v", rule)
+		if err := netlink.RuleAdd(rule); err != nil {
+			return fmt.Errorf("failed to configure netlink rule: %v", err)
+		}
+	}
+
+	return nil
+}
+
+func addOrgSrcMarkRule() error {
+	// Set up tproxy marks
+	var rules []*netlink.Rule
+	// TODO IPv6, append  unix.AF_INET6
+	families := []int{unix.AF_INET}
+	for _, family := range families {
 		// Equiv: "ip rule add priority 20003 fwmark 0x4d3/0xfff lookup 100"
 		orgSrcRule := netlink.NewRule()
 		orgSrcRule.Family = family
@@ -1248,6 +1369,11 @@ func disableRPFiltersForLink(ifaceName string) error {
 	// @TODO: This needs to be cleaned up, there are a lot of martians in AWS
 	// that seem to necessitate this work and in theory we shouldn't *need* to disable
 	// `rp_filter` with eBPF.
+	//
+	// 0 - No source validation.
+	// 1 - Strict mode as defined in RFC3704 Strict Reverse Path
+	// 2 - Loose mode as defined in RFC3704 Loose Reverse Path
+	// Ideally we should be able to set it to 1 (strictest)
 	procs := map[string]int{
 		"/proc/sys/net/ipv4/conf/default/rp_filter":           0,
 		"/proc/sys/net/ipv4/conf/all/rp_filter":               0,
@@ -1268,13 +1394,9 @@ func setProc(path string, value string) error {
 	return os.WriteFile(path, []byte(value), 0o644)
 }
 
-func buildRouteFromPod(pod *corev1.Pod, ip string) ([]string, error) {
+func buildRouteForPod(ip string) ([]string, error) {
 	if ip == "" {
-		ip = pod.Status.PodIP
-	}
-
-	if ip == "" {
-		return nil, errors.New("no ip found")
+		return nil, errors.New("ip is none")
 	}
 
 	return []string{
@@ -1349,6 +1471,10 @@ func deleteTunnelLinks(inboundName, outboundName string, warnOnFail bool) {
 	if err != nil && warnOnFail {
 		log.Warnf("did not find existing inbound tunnel %s to delete: %v", inboundName, err)
 	} else if inboundTun != nil {
+		err = netlink.LinkSetDown(inboundTun)
+		if err != nil {
+			log.Warnf("failed to bring down inbound tunnel: %v", err)
+		}
 		err = netlink.LinkDel(inboundTun)
 		if err != nil && warnOnFail {
 			log.Warnf("error deleting inbound tunnel: %v", err)
@@ -1360,6 +1486,10 @@ func deleteTunnelLinks(inboundName, outboundName string, warnOnFail bool) {
 		// Bail, if we can't find it don't try to delete it
 		return
 	} else if outboundTun != nil {
+		err = netlink.LinkSetDown(outboundTun)
+		if err != nil {
+			log.Warnf("failed to bring down outbound tunnel: %v", err)
+		}
 		err = netlink.LinkDel(outboundTun)
 		if err != nil && warnOnFail {
 			log.Warnf("error deleting outbound tunnel: %v", err)

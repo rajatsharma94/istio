@@ -21,7 +21,6 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	"golang.org/x/exp/slices"
 	"sigs.k8s.io/yaml"
 
 	ztunnelDump "istio.io/istio/istioctl/pkg/util/configdump"
@@ -39,8 +38,18 @@ func (wf *WorkloadFilter) Verify(workload *ztunnelDump.ZtunnelWorkload) bool {
 	if wf.Address == "" && wf.Node == "" {
 		return true
 	}
-	if wf.Address != "" && !strings.EqualFold(workload.WorkloadIP, wf.Address) {
-		return false
+
+	if wf.Address != "" {
+		var find bool
+		for _, ip := range workload.WorkloadIPs {
+			if strings.EqualFold(ip, wf.Address) {
+				find = true
+				break
+			}
+		}
+		if !find {
+			return false
+		}
 	}
 	if wf.Node != "" && !strings.EqualFold(workload.Node, wf.Node) {
 		return false
@@ -80,13 +89,16 @@ func (c *ConfigWriter) PrintWorkloadSummary(filter WorkloadFilter) error {
 		fmt.Fprintln(w, "NAME\tNAMESPACE\tIP\tNODE")
 	}
 
-	waypointsAddrToName := make(map[string]string)
 	for _, wl := range verifiedWorkloads {
+		var ip string
+		if len(wl.WorkloadIPs) > 0 {
+			ip = wl.WorkloadIPs[0]
+		}
 		if filter.Verbose {
-			waypoint := waypointName(wl, waypointsAddrToName, verifiedWorkloads)
-			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\n", wl.Name, wl.Namespace, wl.WorkloadIP, wl.Node, waypoint, wl.Protocol)
+			waypoint := waypointName(wl, zDump.Services)
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\t%v\t%v\n", wl.Name, wl.Namespace, ip, wl.Node, waypoint, wl.Protocol)
 		} else {
-			fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", wl.Name, wl.Namespace, wl.WorkloadIP, wl.Node)
+			fmt.Fprintf(w, "%v\t%v\t%v\t%v\n", wl.Name, wl.Namespace, ip, wl.Node)
 		}
 	}
 	return w.Flush()
@@ -141,18 +153,14 @@ func (c *ConfigWriter) retrieveSortedWorkloadSlice() (*ztunnelDump.ZtunnelDump, 
 	return workloadDump, nil
 }
 
-func waypointName(wl *ztunnelDump.ZtunnelWorkload, prevAddresses map[string]string, workloads []*ztunnelDump.ZtunnelWorkload) string {
-	if len(wl.WaypointAddresses) == 0 {
+func waypointName(wl *ztunnelDump.ZtunnelWorkload, services map[string]*ztunnelDump.ZtunnelService) string {
+	if wl.Waypoint == nil {
 		return "None"
 	}
-	addr := wl.WaypointAddresses[0]
-	if name, ok := prevAddresses[addr]; ok {
-		return name
+
+	if svc, ok := services[wl.Waypoint.Destination]; ok {
+		return svc.Name
 	}
-	if idx := slices.IndexFunc(workloads, func(w *ztunnelDump.ZtunnelWorkload) bool { return w.WorkloadIP == addr }); idx > 0 {
-		wpName := workloads[idx].CanonicalName
-		prevAddresses[addr] = wpName
-		return wpName
-	}
+
 	return "NA" // Shouldn't normally reach here
 }

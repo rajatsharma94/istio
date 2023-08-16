@@ -26,6 +26,7 @@ import (
 	"istio.io/istio/pilot/pkg/model"
 	"istio.io/istio/pilot/pkg/serviceregistry/kube"
 	"istio.io/istio/pkg/config/host"
+	"istio.io/istio/pkg/test/util/assert"
 )
 
 func TestEndpointSliceFromMCSShouldBeIgnored(t *testing.T) {
@@ -35,7 +36,7 @@ func TestEndpointSliceFromMCSShouldBeIgnored(t *testing.T) {
 		appName = "prod-app"
 	)
 
-	controller, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{Mode: EndpointSliceOnly})
+	controller, fx := NewFakeControllerWithOptions(t, FakeControllerOptions{})
 
 	node := generateNode("node1", map[string]string{
 		NodeZoneLabel:              "zone1",
@@ -49,7 +50,7 @@ func TestEndpointSliceFromMCSShouldBeIgnored(t *testing.T) {
 	pods := []*corev1.Pod{pod}
 	addPods(t, controller, fx, pods...)
 
-	createServiceWait(controller, svcName, ns, nil,
+	createServiceWait(controller, svcName, ns, nil, nil,
 		[]int32{8080}, map[string]string{"app": appName}, t)
 
 	// Ensure that the service is available.
@@ -67,11 +68,9 @@ func TestEndpointSliceFromMCSShouldBeIgnored(t *testing.T) {
 	})
 	fx.AssertEmpty(t, time.Millisecond*50)
 
-	// Ensure that getting by port returns no ServiceInstances.
-	instances := controller.InstancesByPort(svc, svc.Ports[0].Port)
-	if len(instances) != 0 {
-		t.Fatalf("should be 0 instances: len(instances) = %v", len(instances))
-	}
+	// Ensure that no endpoint is create
+	endpoints := GetEndpoints(svc, controller.Endpoints)
+	assert.Equal(t, len(endpoints), 0)
 }
 
 func TestEndpointSliceCache(t *testing.T) {

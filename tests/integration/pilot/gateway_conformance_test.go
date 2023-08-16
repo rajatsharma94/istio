@@ -21,13 +21,17 @@ import (
 	"testing"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	controllruntimelog "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/gateway-api/conformance/tests"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
 
 	"istio.io/istio/pkg/kube"
+	"istio.io/istio/pkg/log"
+	"istio.io/istio/pkg/maps"
 	"istio.io/istio/pkg/test/framework"
 	"istio.io/istio/pkg/test/framework/components/crd"
 	"istio.io/istio/pkg/test/framework/components/namespace"
+	"istio.io/istio/pkg/test/framework/label"
 	"istio.io/istio/pkg/test/scopes"
 )
 
@@ -44,21 +48,27 @@ var gatewayConformanceInputs GatewayConformanceInputs
 // defined in sigs.k8s.io/gateway-api/conformance/base/manifests.yaml
 var conformanceNamespaces = []string{
 	"gateway-conformance-infra",
+	"gateway-conformance-mesh",
+	"gateway-conformance-mesh-consumer",
 	"gateway-conformance-app-backend",
 	"gateway-conformance-web-backend",
 }
 
 var skippedTests = map[string]string{
-	"HTTPRouteRedirectPath":          "redirects are changed in 0.7; we support the 0.7 tests but not 0.6",
-	"HTTPRouteRedirectHostAndStatus": "redirects are changed in 0.7; we support the 0.7 tests but not 0.6",
+	"MeshFrontendHostname":          "https://github.com/istio/istio/issues/44702",
+	"GatewayObservedGenerationBump": "https://github.com/istio/istio/issues/44850",
+}
+
+func init() {
+	scope := log.RegisterScope("controlleruntime", "scope for controller runtime")
+	controllruntimelog.SetLogger(log.NewLogrAdapter(scope))
 }
 
 func TestGatewayConformance(t *testing.T) {
-	// nolint: staticcheck
 	framework.
 		NewTest(t).
-		RequiresSingleCluster().
 		Features("traffic.gateway").
+		Label(label.IPv4). // Need https://github.com/kubernetes-sigs/gateway-api/pull/2024 in 0.7.1
 		Run(func(ctx framework.TestContext) {
 			crd.DeployGatewayAPIOrSkip(ctx)
 
@@ -81,16 +91,24 @@ func TestGatewayConformance(t *testing.T) {
 				t.Fatal(err)
 			}
 
+			features := suite.AllFeatures
 			opts := suite.Options{
 				Client:               c,
+				Clientset:            gatewayConformanceInputs.Client.Kube(),
+				RestConfig:           gatewayConformanceInputs.Client.RESTConfig(),
 				GatewayClassName:     "istio",
 				Debug:                scopes.Framework.DebugEnabled(),
 				CleanupBaseResources: gatewayConformanceInputs.Cleanup,
-				SupportedFeatures:    suite.AllFeatures,
+				SupportedFeatures:    features,
+				SkipTests:            maps.Keys(skippedTests),
 			}
 			if rev := ctx.Settings().Revisions.Default(); rev != "" {
 				opts.NamespaceLabels = map[string]string{
 					"istio.io/rev": rev,
+				}
+			} else {
+				opts.NamespaceLabels = map[string]string{
+					"istio-injection": "enabled",
 				}
 			}
 			ctx.Cleanup(func() {
@@ -103,16 +121,9 @@ func TestGatewayConformance(t *testing.T) {
 					}
 				}
 			})
+
 			csuite := suite.New(opts)
 			csuite.Setup(t)
-
-			for _, ct := range tests.ConformanceTests {
-				t.Run(ct.ShortName, func(t *testing.T) {
-					if reason, f := skippedTests[ct.ShortName]; f {
-						t.Skip(reason)
-					}
-					ct.Run(t, csuite)
-				})
-			}
+			csuite.Run(t, tests.ConformanceTests)
 		})
 }
