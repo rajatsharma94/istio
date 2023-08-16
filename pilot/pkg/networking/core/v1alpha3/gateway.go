@@ -530,11 +530,12 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 						}
 					}
 					newVHost := &route.VirtualHost{
-						Name:                       util.DomainName(string(hostname), port),
-						Domains:                    []string{hostname.String()},
-						Routes:                     routes,
-						TypedPerFilterConfig:       perRouteFilters,
-						IncludeRequestAttemptCount: true,
+						Name:                          util.DomainName(string(hostname), port),
+						Domains:                       []string{hostname.String()},
+						Routes:                        routes,
+						TypedPerFilterConfig:          perRouteFilters,
+						IncludeRequestAttemptCount:    true,
+						IncludeAttemptCountInResponse: true,
 					}
 					if server.Tls != nil && server.Tls.HttpsRedirect {
 						newVHost.RequireTls = route.VirtualHost_ALL
@@ -555,10 +556,11 @@ func (configgen *ConfigGeneratorImpl) buildGatewayHTTPRouteConfig(node *model.Pr
 				continue
 			}
 			newVHost := &route.VirtualHost{
-				Name:                       util.DomainName(hostname, port),
-				Domains:                    []string{hostname},
-				IncludeRequestAttemptCount: true,
-				RequireTls:                 route.VirtualHost_ALL,
+				Name:                          util.DomainName(hostname, port),
+				Domains:                       []string{hostname},
+				IncludeRequestAttemptCount:    true,
+				IncludeAttemptCountInResponse: true,
+				RequireTls:                    route.VirtualHost_ALL,
 			}
 			vHostDedupMap[host.Name(hostname)] = newVHost
 		}
